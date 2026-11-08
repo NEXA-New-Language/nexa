@@ -2,6 +2,7 @@ use crate::diagnostics::Diagnostic;
 use crate::syntax::ast::Program;
 
 pub struct SemanticAnalyzer {
+    #[allow(dead_code)]
     file_name: String,
 }
 

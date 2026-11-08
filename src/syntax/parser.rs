@@ -26,13 +26,18 @@ impl<'a> Parser<'a> {
 
         while !self.is_at_end() {
             let stmt = self.parse_statement()?;
+            let is_block_stmt = matches!(
+                stmt,
+                Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::Action { .. }
+            );
             statements.push(stmt);
 
             if self.is_at_end() {
                 break;
             }
 
-            if !self.check(&TokenKind::Newline) && !self.check(&TokenKind::RBrace) {
+            // ブロック文 (if, while, repeat, action) 以外は改行が必須
+            if !is_block_stmt && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::RBrace) {
                 let span = self.current_span();
                 return Err(Diagnostic::error(
                     "Syntax Error",
@@ -139,8 +144,6 @@ impl<'a> Parser<'a> {
         let condition = self.parse_expression(0)?;
         let then_branch = self.parse_block()?;
 
-        self.skip_newlines();
-
         let else_branch = if self.match_token(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
                 let nested_if = self.parse_if_stmt()?;
@@ -200,13 +203,17 @@ impl<'a> Parser<'a> {
 
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let stmt = self.parse_statement()?;
+            let is_block_stmt = matches!(
+                stmt,
+                Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::Action { .. }
+            );
             statements.push(stmt);
 
             if self.check(&TokenKind::RBrace) {
                 break;
             }
 
-            if !self.check(&TokenKind::Newline) {
+            if !is_block_stmt && !self.check(&TokenKind::Newline) {
                 let span = self.current_span();
                 return Err(Diagnostic::error(
                     "Syntax Error",
