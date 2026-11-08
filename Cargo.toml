@@ -1,0 +1,8 @@
+[package]
+name = "nexa"
+version = "0.1.0"
+edition = "2021"
+authors = ["NEXA Core Team"]
+description = "The NEXA Systems & General-Purpose Programming Language"
+
+[dependencies]

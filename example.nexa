@@ -1,0 +1,10 @@
+let name = "NEXA"
+var score = 100
+
+action greet(target) {
+    print("Hello " + target)
+}
+
+if score >= 100 {
+    greet(name)
+}
