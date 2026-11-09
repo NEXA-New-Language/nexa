@@ -1,6 +1,8 @@
+pub mod cli;
 pub mod codegen;
 pub mod diagnostics;
 pub mod ir;
+pub mod project;
 pub mod semantics;
 pub mod span;
 pub mod syntax;
@@ -30,14 +32,12 @@ pub fn analyze_source(file_name: &str, source: &str) -> Result<Program, Diagnost
     Ok(program)
 }
 
-/// NEXAコードから x86-64 アセンブリを生成
 pub fn compile_to_assembly(file_name: &str, source: &str) -> Result<String, Diagnostic> {
     let program = analyze_source(file_name, source)?;
     let codegen = X86_64CodeGen::new();
     Ok(codegen.generate(&program))
 }
 
-/// NEXAコードを直接ネイティブELF実行可能ファイルにコンパイル
 pub fn compile_to_binary(file_name: &str, source: &str, output_path: &str) -> Result<(), Diagnostic> {
     let asm_code = compile_to_assembly(file_name, source)?;
     let temp_asm = format!("{}.s", output_path);
@@ -46,7 +46,6 @@ pub fn compile_to_binary(file_name: &str, source: &str, output_path: &str) -> Re
         Diagnostic::error("IO Error", file_name, crate::span::Span::new(0, 0, 1, 1), format!("Cannot write assembly: {}", e), None)
     })?;
 
-    // システムリンカ (cc) でネイティブバイナリへコンパイル
     let status = Command::new("cc")
         .args(["-no-pie", &temp_asm, "-o", output_path])
         .status()
@@ -54,7 +53,7 @@ pub fn compile_to_binary(file_name: &str, source: &str, output_path: &str) -> Re
             Diagnostic::error("Linker Error", file_name, crate::span::Span::new(0, 0, 1, 1), format!("Failed to invoke linker 'cc': {}", e), None)
         })?;
 
-    let _ = fs::remove_file(&temp_asm); // 一時アセンブリを削除
+    let _ = fs::remove_file(&temp_asm);
 
     if !status.success() {
         return Err(Diagnostic::error(
