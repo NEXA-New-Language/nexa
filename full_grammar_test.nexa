@@ -1,0 +1,35 @@
+// 1. 変数・定数
+let app_name = "NEXA"
+const VERSION = 1
+var score = 100
+
+// 2. 関数 (action) と 文字列結合
+action greet(target) {
+    print("Welcome to " + target)
+}
+
+// 3. 関数呼び出し
+greet(app_name)
+
+// 4. 条件分岐 (if / else)
+if score >= 100 {
+    print("Level: Master")
+} else {
+    print("Level: Beginner")
+}
+
+// 5. repeat ループ
+print("--- Repeat Test ---")
+repeat 3 {
+    print("Repeat Tick")
+}
+
+// 6. while ループ
+print("--- While Test ---")
+var count = 3
+while count > 0 {
+    print(count)
+    count = count - 1
+}
+
+print("All Grammar Passed Natively!")

@@ -1,62 +1,159 @@
 use crate::syntax::ast::*;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NexaType {
+    Int,
+    Str,
+    Bool,
+}
+
 pub struct X86_64CodeGen {
     label_id: usize,
-    string_literals: Vec<(String, String)>, // (label, content)
-    var_offsets: HashMap<String, i32>,
+    string_literals: Vec<(String, String)>,
+    var_table: HashMap<String, (i32, NexaType)>,
+    func_params: HashMap<String, Vec<(String, NexaType)>>,
     current_offset: i32,
 }
 
 impl X86_64CodeGen {
     pub fn new() -> Self {
         Self {
-            
             label_id: 0,
             string_literals: Vec::new(),
-            var_offsets: HashMap::new(),
+            var_table: HashMap::new(),
+            func_params: HashMap::new(),
             current_offset: 0,
         }
     }
 
     pub fn generate(mut self, program: &Program) -> String {
-        let mut text_section = String::new();
+        let mut functions_code = String::new();
+        let mut main_body = String::new();
 
-        // main 関数のプロローグ (スタックフレーム構築)
-        text_section.push_str(".globl main\n");
-        text_section.push_str("main:\n");
-        text_section.push_str("    push rbp\n");
-        text_section.push_str("    mov rbp, rsp\n");
-        text_section.push_str("    sub rsp, 256\n\n"); // ローカル変数用に256バイト確保
-
-        // 各文のコード生成
         for stmt in &program.statements {
-            self.gen_stmt(stmt, &mut text_section);
+            if let Stmt::Action { name, params, .. } = stmt {
+                let p_types = params.iter().map(|p| (p.name.clone(), NexaType::Str)).collect();
+                self.func_params.insert(name.name.clone(), p_types);
+            }
         }
 
-        // main 関数のエピローグ (正常終了: exit code 0)
-        text_section.push_str("\n    mov eax, 0\n");
-        text_section.push_str("    mov rsp, rbp\n");
-        text_section.push_str("    pop rbp\n");
-        text_section.push_str("    ret\n");
+        for stmt in &program.statements {
+            if let Stmt::Action { name, params, body, .. } = stmt {
+                self.gen_action(name, params, body, &mut functions_code);
+            }
+        }
 
-        // .rodata セクション (文字列・フォーマット指定子)
+        self.var_table.clear();
+        self.current_offset = 0;
+
+        for stmt in &program.statements {
+            if !matches!(stmt, Stmt::Action { .. }) {
+                self.gen_stmt(stmt, &mut main_body);
+            }
+        }
+
+        let mut main_code = String::new();
+        main_code.push_str(".globl main\n");
+        main_code.push_str("main:\n");
+        main_code.push_str("    push rbp\n");
+        main_code.push_str("    mov rbp, rsp\n");
+        main_code.push_str("    sub rsp, 512\n\n");
+        main_code.push_str(&main_body);
+        main_code.push_str("\n    mov eax, 0\n");
+        main_code.push_str("    mov rsp, rbp\n");
+        main_code.push_str("    pop rbp\n");
+        main_code.push_str("    ret\n");
+
         let mut rodata_section = String::new();
         rodata_section.push_str(".section .rodata\n");
-        rodata_section.push_str(".LC_fmt_int:\n");
-        rodata_section.push_str("    .string \"%ld\\n\"\n");
-        rodata_section.push_str(".LC_fmt_str:\n");
-        rodata_section.push_str("    .string \"%s\\n\"\n");
+        rodata_section.push_str(".LC_fmt_int:\n    .string \"%ld\\n\"\n");
+        rodata_section.push_str(".LC_fmt_str:\n    .string \"%s\\n\"\n");
+        rodata_section.push_str(".LC_bool_true:\n    .string \"true\"\n");
+        rodata_section.push_str(".LC_bool_false:\n    .string \"false\"\n");
 
         for (lbl, content) in &self.string_literals {
-            rodata_section.push_str(&format!("{}:\n", lbl));
-            rodata_section.push_str(&format!("    .string \"{}\"\n", content));
+            rodata_section.push_str(&format!("{}:\n    .string \"{}\"\n", lbl, content));
         }
 
+        let helper_code = r#"
+.globl __nexa_str_concat
+__nexa_str_concat:
+    push rbp
+    mov rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 16
+
+    mov r12, rdi
+    mov r13, rsi
+
+    mov rdi, r12
+    call strlen
+    mov r14, rax
+
+    mov rdi, r13
+    call strlen
+    mov r15, rax
+
+    lea rdi, [r14 + r15 + 1]
+    call malloc
+    mov rbx, rax
+
+    mov rdi, rbx
+    mov rsi, r12
+    call strcpy
+
+    mov rdi, rbx
+    mov rsi, r13
+    call strcat
+
+    mov rax, rbx
+    add rsp, 16
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    mov rsp, rbp
+    pop rbp
+    ret
+"#;
+
         format!(
-            ".intel_syntax noprefix\n\n{}\n.text\n{}",
-            rodata_section, text_section
+            ".intel_syntax noprefix\n\n{}\n.text\n{}\n{}\n{}\n.section .note.GNU-stack,\"\",@progbits\n",
+            rodata_section, helper_code, functions_code, main_code
         )
+    }
+
+    fn gen_action(&mut self, name: &Ident, params: &[Ident], body: &Block, out: &mut String) {
+        self.var_table.clear();
+        self.current_offset = 0;
+
+        out.push_str(&format!(".globl {}\n", name.name));
+        out.push_str(&format!("{}:\n", name.name));
+        out.push_str("    push rbp\n");
+        out.push_str("    mov rbp, rsp\n");
+        out.push_str("    sub rsp, 256\n");
+
+        let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        for (i, param) in params.iter().enumerate() {
+            if i < arg_regs.len() {
+                self.current_offset -= 8;
+                self.var_table.insert(param.name.clone(), (self.current_offset, NexaType::Str));
+                out.push_str(&format!("    mov [rbp {}], {}\n", self.current_offset, arg_regs[i]));
+            }
+        }
+
+        for stmt in &body.statements {
+            self.gen_stmt(stmt, out);
+        }
+
+        out.push_str("    mov eax, 0\n");
+        out.push_str("    mov rsp, rbp\n");
+        out.push_str("    pop rbp\n");
+        out.push_str("    ret\n\n");
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt, out: &mut String) {
@@ -64,15 +161,15 @@ impl X86_64CodeGen {
             Stmt::Let { name, value, .. }
             | Stmt::Var { name, value, .. }
             | Stmt::Const { name, value, .. } => {
-                self.gen_expr(value, out);
+                let ty = self.gen_expr(value, out);
                 self.current_offset -= 8;
-                self.var_offsets.insert(name.name.clone(), self.current_offset);
+                self.var_table.insert(name.name.clone(), (self.current_offset, ty));
                 out.push_str("    pop rax\n");
                 out.push_str(&format!("    mov [rbp {}], rax\n\n", self.current_offset));
             }
             Stmt::Assign { target, value, .. } => {
                 self.gen_expr(value, out);
-                let offset = *self.var_offsets.get(&target.name).expect("Variable must exist");
+                let (offset, _) = *self.var_table.get(&target.name).expect("Variable must exist");
                 out.push_str("    pop rax\n");
                 out.push_str(&format!("    mov [rbp {}], rax\n\n", offset));
             }
@@ -123,7 +220,6 @@ impl X86_64CodeGen {
                 let repeat_start = self.new_label("repeat_start");
                 let repeat_end = self.new_label("repeat_end");
 
-                // カウンタ用にスタック領域を割り当て
                 self.current_offset -= 8;
                 let counter_offset = self.current_offset;
 
@@ -146,61 +242,73 @@ impl X86_64CodeGen {
             }
             Stmt::Expr(expr) => {
                 self.gen_expr(expr, out);
-                // 式文の結果は破棄
                 out.push_str("    add rsp, 8\n\n");
             }
-            Stmt::Action { .. } => {
-                // 関数定義は次ステップで拡張
-            }
+            Stmt::Action { .. } => {}
         }
     }
 
-    fn gen_expr(&mut self, expr: &Expr, out: &mut String) {
+    fn gen_expr(&mut self, expr: &Expr, out: &mut String) -> NexaType {
         match expr {
             Expr::Literal { lit, .. } => match lit {
                 Literal::Int(val) => {
                     out.push_str(&format!("    mov rax, {}\n", val));
                     out.push_str("    push rax\n");
+                    NexaType::Int
                 }
                 Literal::Bool(b) => {
                     let val = if *b { 1 } else { 0 };
                     out.push_str(&format!("    mov rax, {}\n", val));
                     out.push_str("    push rax\n");
+                    NexaType::Bool
                 }
                 Literal::Str(s) => {
                     let lbl = self.new_label("str");
                     self.string_literals.push((lbl.clone(), s.clone()));
                     out.push_str(&format!("    lea rax, [rip + {}]\n", lbl));
                     out.push_str("    push rax\n");
+                    NexaType::Str
                 }
-                Literal::Float(_) => {
-                    // 浮動小数点 (xmmレジスタ) は次ステップで拡張
-                }
+                Literal::Float(_) => NexaType::Int,
             },
             Expr::Variable { name } => {
-                let offset = *self.var_offsets.get(&name.name).expect("Variable must exist");
+                let (offset, ty) = *self.var_table.get(&name.name).expect("Variable must exist");
                 out.push_str(&format!("    mov rax, [rbp {}]\n", offset));
                 out.push_str("    push rax\n");
+                ty
             }
             Expr::Unary { op, expr, .. } => {
                 self.gen_expr(expr, out);
                 out.push_str("    pop rax\n");
                 match op {
-                    UnaryOp::Negate => out.push_str("    neg rax\n"),
+                    UnaryOp::Negate => {
+                        out.push_str("    neg rax\n");
+                        out.push_str("    push rax\n");
+                        NexaType::Int
+                    }
                     UnaryOp::Not => {
                         out.push_str("    cmp rax, 0\n");
                         out.push_str("    sete al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        NexaType::Bool
                     }
                 }
-                out.push_str("    push rax\n");
             }
             Expr::Binary { left, op, right, .. } => {
-                self.gen_expr(left, out);
-                self.gen_expr(right, out);
+                let ty_left = self.gen_expr(left, out);
+                let ty_right = self.gen_expr(right, out);
 
-                out.push_str("    pop rbx\n"); // 右辺
-                out.push_str("    pop rax\n"); // 左辺
+                out.push_str("    pop rbx\n");
+                out.push_str("    pop rax\n");
+
+                if *op == BinaryOp::Add && (ty_left == NexaType::Str || ty_right == NexaType::Str) {
+                    out.push_str("    mov rdi, rax\n");
+                    out.push_str("    mov rsi, rbx\n");
+                    out.push_str("    call __nexa_str_concat\n");
+                    out.push_str("    push rax\n");
+                    return NexaType::Str;
+                }
 
                 match op {
                     BinaryOp::Add => out.push_str("    add rax, rbx\n"),
@@ -219,51 +327,97 @@ impl X86_64CodeGen {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    sete al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
                     BinaryOp::NotEqual => {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    setne al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
                     BinaryOp::Less => {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    setl al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
                     BinaryOp::LessEq => {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    setle al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
                     BinaryOp::Greater => {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    setg al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
                     BinaryOp::GreaterEq => {
                         out.push_str("    cmp rax, rbx\n");
                         out.push_str("    setge al\n");
                         out.push_str("    movzx rax, al\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
                     }
-                    BinaryOp::And => out.push_str("    and rax, rbx\n"),
-                    BinaryOp::Or => out.push_str("    or rax, rbx\n"),
+                    BinaryOp::And => {
+                        out.push_str("    and rax, rbx\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
+                    }
+                    BinaryOp::Or => {
+                        out.push_str("    or rax, rbx\n");
+                        out.push_str("    push rax\n");
+                        return NexaType::Bool;
+                    }
                 }
                 out.push_str("    push rax\n");
+                NexaType::Int
             }
             Expr::Call { callee, args, .. } => {
                 if callee.name == "print" {
-                    let is_str = matches!(args.first(), Some(Expr::Literal { lit: Literal::Str(_), .. }));
-                    self.gen_expr(&args[0], out);
-
+                    let arg_type = self.gen_expr(&args[0], out);
                     out.push_str("    pop rsi\n");
-                    if is_str {
-                        out.push_str("    lea rdi, [rip + .LC_fmt_str]\n");
-                    } else {
-                        out.push_str("    lea rdi, [rip + .LC_fmt_int]\n");
+                    match arg_type {
+                        NexaType::Str => out.push_str("    lea rdi, [rip + .LC_fmt_str]\n"),
+                        NexaType::Int => out.push_str("    lea rdi, [rip + .LC_fmt_int]\n"),
+                        NexaType::Bool => {
+                            let true_lbl = self.new_label("btrue");
+                            let end_lbl = self.new_label("bend");
+                            out.push_str("    cmp rsi, 0\n");
+                            out.push_str(&format!("    jne {}\n", true_lbl));
+                            out.push_str("    lea rdi, [rip + .LC_bool_false]\n");
+                            out.push_str(&format!("    jmp {}\n", end_lbl));
+                            out.push_str(&format!("{}:\n", true_lbl));
+                            out.push_str("    lea rdi, [rip + .LC_bool_true]\n");
+                            out.push_str(&format!("{}:\n", end_lbl));
+                            out.push_str("    call puts\n");
+                            out.push_str("    push 0\n");
+                            return NexaType::Int;
+                        }
                     }
                     out.push_str("    mov eax, 0\n");
                     out.push_str("    call printf\n");
-                    out.push_str("    push 0\n"); // printのダミー返り値
+                    out.push_str("    push 0\n");
+                    NexaType::Int
+                } else {
+                    let arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+                    for arg in args {
+                        self.gen_expr(arg, out);
+                    }
+                    for i in (0..args.len()).rev() {
+                        if i < arg_regs.len() {
+                            out.push_str(&format!("    pop {}\n", arg_regs[i]));
+                        }
+                    }
+                    out.push_str(&format!("    call {}\n", callee.name));
+                    out.push_str("    push rax\n");
+                    NexaType::Int
                 }
             }
         }
