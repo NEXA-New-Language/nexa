@@ -12,11 +12,11 @@ pub mod vm;
 use codegen::X86_64CodeGen;
 use diagnostics::Diagnostic;
 use semantics::SemanticAnalyzer;
+use std::fs;
+use std::process::Command;
 use syntax::ast::Program;
 use syntax::lexer::Lexer;
 use syntax::parser::Parser;
-use std::fs;
-use std::process::Command;
 
 pub fn parse_source(file_name: &str, source: &str) -> Result<Program, Diagnostic> {
     let mut lexer = Lexer::new(file_name, source);
@@ -38,19 +38,35 @@ pub fn compile_to_assembly(file_name: &str, source: &str) -> Result<String, Diag
     Ok(codegen.generate(&program))
 }
 
-pub fn compile_to_binary(file_name: &str, source: &str, output_path: &str) -> Result<(), Diagnostic> {
+pub fn compile_to_binary(
+    file_name: &str,
+    source: &str,
+    output_path: &str,
+) -> Result<(), Diagnostic> {
     let asm_code = compile_to_assembly(file_name, source)?;
     let temp_asm = format!("{}.s", output_path);
 
     fs::write(&temp_asm, asm_code).map_err(|e| {
-        Diagnostic::error("IO Error", file_name, crate::span::Span::new(0, 0, 1, 1), format!("Cannot write assembly: {}", e), None)
+        Diagnostic::error(
+            "IO Error",
+            file_name,
+            crate::span::Span::new(0, 0, 1, 1),
+            format!("Cannot write assembly: {}", e),
+            None,
+        )
     })?;
 
     let status = Command::new("cc")
         .args(["-no-pie", &temp_asm, "-o", output_path])
         .status()
         .map_err(|e| {
-            Diagnostic::error("Linker Error", file_name, crate::span::Span::new(0, 0, 1, 1), format!("Failed to invoke linker 'cc': {}", e), None)
+            Diagnostic::error(
+                "Linker Error",
+                file_name,
+                crate::span::Span::new(0, 0, 1, 1),
+                format!("Failed to invoke linker 'cc': {}", e),
+                None,
+            )
         })?;
 
     let _ = fs::remove_file(&temp_asm);

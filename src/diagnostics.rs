@@ -42,7 +42,10 @@ impl Diagnostic {
 
         let mut out = String::new();
         out.push_str(&format!("Error: {}\n\n", self.kind));
-        out.push_str(&format!("{}:{}:{}\n\n", self.file_name, self.span.line, self.span.col));
+        out.push_str(&format!(
+            "{}:{}:{}\n\n",
+            self.file_name, self.span.line, self.span.col
+        ));
         out.push_str(&format!("{}\n", source_line));
         out.push_str(&format!("{}{}\n\n", indent, carets));
         out.push_str(&format!("{}\n", self.message));

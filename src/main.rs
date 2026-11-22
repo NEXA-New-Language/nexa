@@ -69,7 +69,9 @@ fn main() {
         "test" => CliHandler::handle_test(),
         "add" => {
             if args.len() < 3 {
-                eprintln!("Error: Package name required. Example: nexa add helper --path ../helper");
+                eprintln!(
+                    "Error: Package name required. Example: nexa add helper --path ../helper"
+                );
                 process::exit(1);
             }
             let name = &args[2];

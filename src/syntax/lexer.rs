@@ -65,89 +65,149 @@ impl<'a> Lexer<'a> {
                 }
                 '(' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::LParen, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::LParen,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 ')' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::RParen, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::RParen,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '{' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::LBrace, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::LBrace,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '}' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::RBrace, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::RBrace,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 ',' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Comma, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Comma,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '+' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Plus, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Plus,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '-' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Minus, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Minus,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '*' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Star, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Star,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '/' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Slash, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Slash,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '%' => {
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Percent, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Percent,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '=' => {
                     self.advance_char();
                     if self.peek_char() == Some('=') {
                         self.advance_char();
-                        tokens.push(Token::new(TokenKind::EqEqual, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::EqEqual,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     } else {
-                        tokens.push(Token::new(TokenKind::Assign, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::Assign,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     }
                 }
                 '!' => {
                     self.advance_char();
                     if self.peek_char() == Some('=') {
                         self.advance_char();
-                        tokens.push(Token::new(TokenKind::NotEqual, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::NotEqual,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     } else {
-                        tokens.push(Token::new(TokenKind::Not, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::Not,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     }
                 }
                 '<' => {
                     self.advance_char();
                     if self.peek_char() == Some('=') {
                         self.advance_char();
-                        tokens.push(Token::new(TokenKind::LessEq, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::LessEq,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     } else {
-                        tokens.push(Token::new(TokenKind::Less, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::Less,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     }
                 }
                 '>' => {
                     self.advance_char();
                     if self.peek_char() == Some('=') {
                         self.advance_char();
-                        tokens.push(Token::new(TokenKind::GreaterEq, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::GreaterEq,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     } else {
-                        tokens.push(Token::new(TokenKind::Greater, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                        tokens.push(Token::new(
+                            TokenKind::Greater,
+                            Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                        ));
                     }
                 }
                 '&' if self.peek_next_char() == Some('&') => {
                     self.advance_char();
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::And, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::And,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '|' if self.peek_next_char() == Some('|') => {
                     self.advance_char();
                     self.advance_char();
-                    tokens.push(Token::new(TokenKind::Or, Span::new(start_pos, self.current_byte_pos(), start_line, start_col)));
+                    tokens.push(Token::new(
+                        TokenKind::Or,
+                        Span::new(start_pos, self.current_byte_pos(), start_line, start_col),
+                    ));
                 }
                 '"' => {
                     let tok = self.read_string(start_pos, start_line, start_col)?;
@@ -180,7 +240,12 @@ impl<'a> Lexer<'a> {
         Ok(tokens)
     }
 
-    fn read_string(&mut self, start_pos: usize, start_line: usize, start_col: usize) -> Result<Token, Diagnostic> {
+    fn read_string(
+        &mut self,
+        start_pos: usize,
+        start_line: usize,
+        start_col: usize,
+    ) -> Result<Token, Diagnostic> {
         self.advance_char();
         let mut text = String::new();
 
@@ -194,13 +259,33 @@ impl<'a> Lexer<'a> {
                 '\\' => {
                     self.advance_char();
                     match self.peek_char() {
-                        Some('n') => { self.advance_char(); text.push('\n'); }
-                        Some('t') => { self.advance_char(); text.push('\t'); }
-                        Some('r') => { self.advance_char(); text.push('\r'); }
-                        Some('\\') => { self.advance_char(); text.push('\\'); }
-                        Some('"') => { self.advance_char(); text.push('"'); }
+                        Some('n') => {
+                            self.advance_char();
+                            text.push('\n');
+                        }
+                        Some('t') => {
+                            self.advance_char();
+                            text.push('\t');
+                        }
+                        Some('r') => {
+                            self.advance_char();
+                            text.push('\r');
+                        }
+                        Some('\\') => {
+                            self.advance_char();
+                            text.push('\\');
+                        }
+                        Some('"') => {
+                            self.advance_char();
+                            text.push('"');
+                        }
                         Some(other) => {
-                            let span = Span::new(self.current_byte_pos(), self.current_byte_pos() + 1, self.line, self.col);
+                            let span = Span::new(
+                                self.current_byte_pos(),
+                                self.current_byte_pos() + 1,
+                                self.line,
+                                self.col,
+                            );
                             return Err(Diagnostic::error(
                                 "Invalid escape sequence",
                                 self.file_name,
@@ -239,13 +324,21 @@ impl<'a> Lexer<'a> {
         ))
     }
 
-    fn read_number(&mut self, start_pos: usize, start_line: usize, start_col: usize) -> Result<Token, Diagnostic> {
+    fn read_number(
+        &mut self,
+        start_pos: usize,
+        start_line: usize,
+        start_col: usize,
+    ) -> Result<Token, Diagnostic> {
         let mut is_float = false;
 
         while let Some(ch) = self.peek_char() {
             if ch.is_ascii_digit() {
                 self.advance_char();
-            } else if ch == '.' && !is_float && self.peek_next_char().map_or(false, |c| c.is_ascii_digit()) {
+            } else if ch == '.'
+                && !is_float
+                && self.peek_next_char().map_or(false, |c| c.is_ascii_digit())
+            {
                 is_float = true;
                 self.advance_char();
             } else {
@@ -282,7 +375,12 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn read_identifier_or_keyword(&mut self, start_pos: usize, start_line: usize, start_col: usize) -> Token {
+    fn read_identifier_or_keyword(
+        &mut self,
+        start_pos: usize,
+        start_line: usize,
+        start_col: usize,
+    ) -> Token {
         while let Some(ch) = self.peek_char() {
             if ch.is_alphanumeric() || ch == '_' {
                 self.advance_char();

@@ -42,10 +42,18 @@ pub struct BuildConfig {
     pub output: String,
 }
 
-fn default_entry() -> String { "src/main.nexa".to_string() }
-fn default_target() -> String { "native".to_string() }
-fn default_optimization() -> String { "release".to_string() }
-fn default_output() -> String { "build".to_string() }
+fn default_entry() -> String {
+    "src/main.nexa".to_string()
+}
+fn default_target() -> String {
+    "native".to_string()
+}
+fn default_optimization() -> String {
+    "release".to_string()
+}
+fn default_output() -> String {
+    "build".to_string()
+}
 
 impl Default for BuildConfig {
     fn default() -> Self {
@@ -80,13 +88,11 @@ impl Manifest {
             ));
         }
 
-        let content = fs::read_to_string(&manifest_path).map_err(|e| {
-            format!("Failed to read '{}': {}", manifest_path.display(), e)
-        })?;
+        let content = fs::read_to_string(&manifest_path)
+            .map_err(|e| format!("Failed to read '{}': {}", manifest_path.display(), e))?;
 
-        let manifest: Manifest = toml::from_str(&content).map_err(|e| {
-            format!("Failed to parse '{}':\n{}", manifest_path.display(), e)
-        })?;
+        let manifest: Manifest = toml::from_str(&content)
+            .map_err(|e| format!("Failed to parse '{}':\n{}", manifest_path.display(), e))?;
 
         manifest.validate(&manifest_path)?;
         Ok((manifest, manifest_path))
@@ -96,7 +102,10 @@ impl Manifest {
         let filename = path.to_string_lossy();
 
         if self.project.name.is_empty() {
-            return Err(format!("Error: Invalid project configuration in {}\nProject name cannot be empty.", filename));
+            return Err(format!(
+                "Error: Invalid project configuration in {}\nProject name cannot be empty.",
+                filename
+            ));
         }
         let first_char = self.project.name.chars().next().unwrap();
         if !first_char.is_ascii_alphabetic() {
@@ -105,7 +114,12 @@ impl Manifest {
                 self.project.name, filename
             ));
         }
-        if !self.project.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        if !self
+            .project
+            .name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             return Err(format!(
                 "Error: Invalid project name '{}' in {}\nProject name can only contain alphanumeric characters, underscores, and hyphens.",
                 self.project.name, filename
@@ -138,8 +152,10 @@ impl Manifest {
     }
 
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let content = toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize manifest: {}", e))?;
-        fs::write(path, content).map_err(|e| format!("Failed to write manifest to '{}': {}", path.display(), e))?;
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| format!("Failed to serialize manifest: {}", e))?;
+        fs::write(path, content)
+            .map_err(|e| format!("Failed to write manifest to '{}': {}", path.display(), e))?;
         Ok(())
     }
 }

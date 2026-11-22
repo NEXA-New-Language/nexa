@@ -21,10 +21,13 @@ if score >= 100 {
     match &program.statements[0] {
         Stmt::Let { name, value, .. } => {
             assert_eq!(name.name, "name");
-            assert_eq!(value, &Expr::Literal {
-                lit: Literal::Str("NEXA".to_string()),
-                span: value.span(),
-            });
+            assert_eq!(
+                value,
+                &Expr::Literal {
+                    lit: Literal::Str("NEXA".to_string()),
+                    span: value.span(),
+                }
+            );
         }
         other => panic!("Expected Stmt::Let, got {:?}", other),
     }
@@ -32,16 +35,21 @@ if score >= 100 {
     match &program.statements[1] {
         Stmt::Var { name, value, .. } => {
             assert_eq!(name.name, "score");
-            assert_eq!(value, &Expr::Literal {
-                lit: Literal::Int(100),
-                span: value.span(),
-            });
+            assert_eq!(
+                value,
+                &Expr::Literal {
+                    lit: Literal::Int(100),
+                    span: value.span(),
+                }
+            );
         }
         other => panic!("Expected Stmt::Var, got {:?}", other),
     }
 
     match &program.statements[2] {
-        Stmt::Action { name, params, body, .. } => {
+        Stmt::Action {
+            name, params, body, ..
+        } => {
             assert_eq!(name.name, "greet");
             assert_eq!(params.len(), 1);
             assert_eq!(params[0].name, "target");
@@ -51,7 +59,12 @@ if score >= 100 {
     }
 
     match &program.statements[3] {
-        Stmt::If { condition, then_branch, else_branch, .. } => {
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
             match condition {
                 Expr::Binary { op, .. } => assert_eq!(*op, BinaryOp::GreaterEq),
                 other => panic!("Expected GreaterEq condition, got {:?}", other),

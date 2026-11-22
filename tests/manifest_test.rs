@@ -14,7 +14,9 @@ version = "1.0.0"
 version = "1.0"
 "#;
     let manifest: Manifest = toml::from_str(toml_str).expect("Should parse");
-    manifest.validate(Path::new("nexa.toml")).expect("Should be valid");
+    manifest
+        .validate(Path::new("nexa.toml"))
+        .expect("Should be valid");
 
     // デフォルト値の検証
     assert_eq!(manifest.build.entry, "src/main.nexa");

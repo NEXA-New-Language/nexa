@@ -19,19 +19,26 @@ fn test_project_lifecycle() {
     assert_eq!(manifest.project.name, "test_app");
     assert_eq!(manifest.build.target, "native");
 
-    let debug_res = NativeBuilder::build(test_dir, BuildMode::Debug).expect("Debug build should succeed");
+    let debug_res =
+        NativeBuilder::build(test_dir, BuildMode::Debug).expect("Debug build should succeed");
     assert!(debug_res.binary_path.exists());
     assert!(debug_res.binary_path.to_string_lossy().contains("debug"));
 
     let lock_path = test_dir.join("nexa.lock");
     assert!(lock_path.exists());
-    let lockfile = Lockfile::load(&lock_path).unwrap().expect("Lockfile must exist");
+    let lockfile = Lockfile::load(&lock_path)
+        .unwrap()
+        .expect("Lockfile must exist");
     assert_eq!(lockfile.packages.len(), 1);
     assert_eq!(lockfile.packages[0].name, "test_app");
 
-    let release_res = NativeBuilder::build(test_dir, BuildMode::Release).expect("Release build should succeed");
+    let release_res =
+        NativeBuilder::build(test_dir, BuildMode::Release).expect("Release build should succeed");
     assert!(release_res.binary_path.exists());
-    assert!(release_res.binary_path.to_string_lossy().contains("release"));
+    assert!(release_res
+        .binary_path
+        .to_string_lossy()
+        .contains("release"));
 
     let _ = fs::remove_dir_all(test_dir);
 }

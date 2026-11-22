@@ -37,7 +37,8 @@ impl<'a> Parser<'a> {
             }
 
             // ブロック文 (if, while, repeat, action) 以外は改行が必須
-            if !is_block_stmt && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::RBrace) {
+            if !is_block_stmt && !self.check(&TokenKind::Newline) && !self.check(&TokenKind::RBrace)
+            {
                 let span = self.current_span();
                 return Err(Diagnostic::error(
                     "Syntax Error",
@@ -320,7 +321,8 @@ impl<'a> Parser<'a> {
                             break;
                         }
                     }
-                    let rparen = self.expect(&TokenKind::RParen, "Expected ')' after call arguments.")?;
+                    let rparen =
+                        self.expect(&TokenKind::RParen, "Expected ')' after call arguments.")?;
                     let span = ident.span.to(rparen.span);
 
                     Ok(Expr::Call {
@@ -334,7 +336,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::LParen => {
                 let expr = self.parse_expression(0)?;
-                self.expect(&TokenKind::RParen, "Expected ')' after grouping expression.")?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "Expected ')' after grouping expression.",
+                )?;
                 Ok(expr)
             }
             _ => Err(Diagnostic::error(

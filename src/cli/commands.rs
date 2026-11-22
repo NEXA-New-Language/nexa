@@ -15,7 +15,10 @@ impl CliHandler {
     pub fn handle_new(name: &str) -> Result<(), String> {
         let target_dir = Path::new(name);
         if target_dir.exists() {
-            return Err(format!("Error: Destination directory '{}' already exists.", name));
+            return Err(format!(
+                "Error: Destination directory '{}' already exists.",
+                name
+            ));
         }
         ProjectTemplate::create_project(target_dir, name)?;
         println!("     Created binary (native) `{}` project", name);
@@ -34,13 +37,20 @@ impl CliHandler {
             return Err("Error: 'nexa.toml' already exists in current directory.".to_string());
         }
         ProjectTemplate::create_project(&current_dir, name)?;
-        println!(" Initialized binary (native) `{}` in current directory", name);
+        println!(
+            " Initialized binary (native) `{}` in current directory",
+            name
+        );
         Ok(())
     }
 
     pub fn handle_build(release: bool) -> Result<(), String> {
         let project_dir = Self::find_project_root()?;
-        let mode = if release { BuildMode::Release } else { BuildMode::Debug };
+        let mode = if release {
+            BuildMode::Release
+        } else {
+            BuildMode::Debug
+        };
 
         let result = NativeBuilder::build(&project_dir, mode)?;
 
@@ -69,18 +79,23 @@ impl CliHandler {
 
     pub fn handle_run(release: bool) -> Result<(), String> {
         let project_dir = Self::find_project_root()?;
-        let mode = if release { BuildMode::Release } else { BuildMode::Debug };
+        let mode = if release {
+            BuildMode::Release
+        } else {
+            BuildMode::Debug
+        };
 
         let result = NativeBuilder::build(&project_dir, mode)?;
 
-        println!(
-            "     Running `{}`",
-            result.binary_path.display()
-        );
+        println!("     Running `{}`", result.binary_path.display());
 
-        let status: ExitStatus = Command::new(&result.binary_path)
-            .status()
-            .map_err(|e| format!("Failed to execute '{}': {}", result.binary_path.display(), e))?;
+        let status: ExitStatus = Command::new(&result.binary_path).status().map_err(|e| {
+            format!(
+                "Failed to execute '{}': {}",
+                result.binary_path.display(),
+                e
+            )
+        })?;
 
         if !status.success() {
             std::process::exit(status.code().unwrap_or(1));
@@ -99,7 +114,10 @@ impl CliHandler {
 
         let source = fs::read_to_string(&entry_path).map_err(|e| e.to_string())?;
 
-        println!("    Checking `{}` v{}", manifest.project.name, manifest.project.version);
+        println!(
+            "    Checking `{}` v{}",
+            manifest.project.name, manifest.project.version
+        );
         match analyze_source(entry_path.to_str().unwrap(), &source) {
             Ok(_) => {
                 println!("    Finished check: no syntax or semantic errors found.");
@@ -142,7 +160,11 @@ impl CliHandler {
             let test_name = test_path.file_name().unwrap().to_string_lossy();
             let source = fs::read_to_string(&test_path).map_err(|e| e.to_string())?;
 
-            match crate::compile_to_binary(test_path.to_str().unwrap(), &source, temp_bin.to_str().unwrap()) {
+            match crate::compile_to_binary(
+                test_path.to_str().unwrap(),
+                &source,
+                temp_bin.to_str().unwrap(),
+            ) {
                 Ok(_) => {
                     let output = Command::new(&temp_bin).output();
                     let _ = fs::remove_file(&temp_bin);
@@ -153,7 +175,11 @@ impl CliHandler {
                             passed += 1;
                         }
                         Ok(out) => {
-                            println!("test {} ... FAILED (Exit code: {:?})", test_name, out.status.code());
+                            println!(
+                                "test {} ... FAILED (Exit code: {:?})",
+                                test_name,
+                                out.status.code()
+                            );
                             failed += 1;
                         }
                         Err(e) => {
@@ -163,13 +189,22 @@ impl CliHandler {
                     }
                 }
                 Err(diag) => {
-                    println!("test {} ... COMPILATION FAILED:\n{}", test_name, diag.render(&source));
+                    println!(
+                        "test {} ... COMPILATION FAILED:\n{}",
+                        test_name,
+                        diag.render(&source)
+                    );
                     failed += 1;
                 }
             }
         }
 
-        println!("\ntest result: {}. {} passed; {} failed", if failed == 0 { "ok" } else { "FAILED" }, passed, failed);
+        println!(
+            "\ntest result: {}. {} passed; {} failed",
+            if failed == 0 { "ok" } else { "FAILED" },
+            passed,
+            failed
+        );
         if failed > 0 {
             std::process::exit(1);
         }
@@ -233,13 +268,15 @@ impl CliHandler {
                 "0000000000000000".to_string()
             };
 
-            lockfile.packages.push(crate::project::lockfile::LockedPackage {
-                name: dep.name,
-                version: dep.version,
-                source: dep.source_desc,
-                checksum,
-                dependencies: Vec::new(),
-            });
+            lockfile
+                .packages
+                .push(crate::project::lockfile::LockedPackage {
+                    name: dep.name,
+                    version: dep.version,
+                    source: dep.source_desc,
+                    checksum,
+                    dependencies: Vec::new(),
+                });
         }
 
         lockfile.save(&lock_path)?;

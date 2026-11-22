@@ -22,10 +22,7 @@ pub struct BuildResult {
 pub struct NativeBuilder;
 
 impl NativeBuilder {
-    pub fn build(
-        project_dir: &Path,
-        mode: BuildMode,
-    ) -> Result<BuildResult, String> {
+    pub fn build(project_dir: &Path, mode: BuildMode) -> Result<BuildResult, String> {
         let start_time = Instant::now();
 
         let (manifest, _) = Manifest::load_from_dir(project_dir)?;
@@ -39,7 +36,11 @@ impl NativeBuilder {
         }
 
         let source = fs::read_to_string(&entry_path).map_err(|e| {
-            format!("Failed to read source file '{}': {}", entry_path.display(), e)
+            format!(
+                "Failed to read source file '{}': {}",
+                entry_path.display(),
+                e
+            )
         })?;
 
         let mode_subdir = match mode {
@@ -48,7 +49,11 @@ impl NativeBuilder {
         };
         let out_dir = project_dir.join(&manifest.build.output).join(mode_subdir);
         fs::create_dir_all(&out_dir).map_err(|e| {
-            format!("Failed to create output directory '{}': {}", out_dir.display(), e)
+            format!(
+                "Failed to create output directory '{}': {}",
+                out_dir.display(),
+                e
+            )
         })?;
 
         let binary_path = out_dir.join(&manifest.project.name);
@@ -58,7 +63,11 @@ impl NativeBuilder {
             .map_err(|diag| diag.render(&source))?;
 
         fs::write(&temp_asm_path, &asm_code).map_err(|e| {
-            format!("Failed to write assembly to '{}': {}", temp_asm_path.display(), e)
+            format!(
+                "Failed to write assembly to '{}': {}",
+                temp_asm_path.display(),
+                e
+            )
         })?;
 
         let mut cc_args = vec!["-no-pie"];
@@ -91,7 +100,9 @@ impl NativeBuilder {
         let mut lockfile = Lockfile::load(&lock_path)?.unwrap_or_else(Lockfile::new);
         let checksum = Lockfile::compute_checksum(source.as_bytes());
 
-        lockfile.packages.retain(|p| p.name != manifest.project.name);
+        lockfile
+            .packages
+            .retain(|p| p.name != manifest.project.name);
         lockfile.packages.push(LockedPackage {
             name: manifest.project.name.clone(),
             version: manifest.project.version.clone(),

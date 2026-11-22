@@ -33,13 +33,19 @@ impl X86_64CodeGen {
 
         for stmt in &program.statements {
             if let Stmt::Action { name, params, .. } = stmt {
-                let p_types = params.iter().map(|p| (p.name.clone(), NexaType::Str)).collect();
+                let p_types = params
+                    .iter()
+                    .map(|p| (p.name.clone(), NexaType::Str))
+                    .collect();
                 self.func_params.insert(name.name.clone(), p_types);
             }
         }
 
         for stmt in &program.statements {
-            if let Stmt::Action { name, params, body, .. } = stmt {
+            if let Stmt::Action {
+                name, params, body, ..
+            } = stmt
+            {
                 self.gen_action(name, params, body, &mut functions_code);
             }
         }
@@ -141,8 +147,12 @@ __nexa_str_concat:
         for (i, param) in params.iter().enumerate() {
             if i < arg_regs.len() {
                 self.current_offset -= 8;
-                self.var_table.insert(param.name.clone(), (self.current_offset, NexaType::Str));
-                out.push_str(&format!("    mov [rbp {}], {}\n", self.current_offset, arg_regs[i]));
+                self.var_table
+                    .insert(param.name.clone(), (self.current_offset, NexaType::Str));
+                out.push_str(&format!(
+                    "    mov [rbp {}], {}\n",
+                    self.current_offset, arg_regs[i]
+                ));
             }
         }
 
@@ -163,17 +173,26 @@ __nexa_str_concat:
             | Stmt::Const { name, value, .. } => {
                 let ty = self.gen_expr(value, out);
                 self.current_offset -= 8;
-                self.var_table.insert(name.name.clone(), (self.current_offset, ty));
+                self.var_table
+                    .insert(name.name.clone(), (self.current_offset, ty));
                 out.push_str("    pop rax\n");
                 out.push_str(&format!("    mov [rbp {}], rax\n\n", self.current_offset));
             }
             Stmt::Assign { target, value, .. } => {
                 self.gen_expr(value, out);
-                let (offset, _) = *self.var_table.get(&target.name).expect("Variable must exist");
+                let (offset, _) = *self
+                    .var_table
+                    .get(&target.name)
+                    .expect("Variable must exist");
                 out.push_str("    pop rax\n");
                 out.push_str(&format!("    mov [rbp {}], rax\n\n", offset));
             }
-            Stmt::If { condition, then_branch, else_branch, .. } => {
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
                 let else_lbl = self.new_label("else");
                 let end_lbl = self.new_label("endif");
 
@@ -199,7 +218,9 @@ __nexa_str_concat:
                 }
                 out.push_str(&format!("{}:\n", end_lbl));
             }
-            Stmt::While { condition, body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 let loop_start = self.new_label("while_start");
                 let loop_end = self.new_label("while_end");
 
@@ -295,7 +316,9 @@ __nexa_str_concat:
                     }
                 }
             }
-            Expr::Binary { left, op, right, .. } => {
+            Expr::Binary {
+                left, op, right, ..
+            } => {
                 let ty_left = self.gen_expr(left, out);
                 let ty_right = self.gen_expr(right, out);
 
