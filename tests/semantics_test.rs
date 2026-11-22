@@ -225,7 +225,7 @@ fn rejects_action_argument_type_mismatch() {
     rejects(
         r#"
 action greet(target) {
-    print(target)
+    print("Hello " + target)
 }
 greet(123)
 "#,

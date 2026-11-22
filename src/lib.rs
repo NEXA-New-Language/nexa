@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 pub mod cli;
 pub mod codegen;
 pub mod diagnostics;
@@ -33,9 +35,11 @@ pub fn analyze_source(file_name: &str, source: &str) -> Result<Program, Diagnost
 }
 
 pub fn compile_to_assembly(file_name: &str, source: &str) -> Result<String, Diagnostic> {
-    let program = analyze_source(file_name, source)?;
+    let program = parse_source(file_name, source)?;
+    let mut analyzer = SemanticAnalyzer::new(file_name);
+    let analyzed = analyzer.analyze_program(&program)?;
     let codegen = X86_64CodeGen::new();
-    Ok(codegen.generate(&program))
+    Ok(codegen.generate_analyzed(&analyzed))
 }
 
 pub fn compile_to_binary(
@@ -44,7 +48,20 @@ pub fn compile_to_binary(
     output_path: &str,
 ) -> Result<(), Diagnostic> {
     let asm_code = compile_to_assembly(file_name, source)?;
-    let temp_asm = format!("{}.s", output_path);
+    if let Some(parent) = std::path::Path::new(output_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                Diagnostic::error(
+                    "IO Error",
+                    file_name,
+                    crate::span::Span::new(0, 0, 1, 1),
+                    format!("Cannot create output directory: {}", e),
+                    None,
+                )
+            })?;
+        }
+    }
+    let temp_asm = format!("{}.{}.s", output_path, std::process::id());
 
     fs::write(&temp_asm, asm_code).map_err(|e| {
         Diagnostic::error(
@@ -57,7 +74,7 @@ pub fn compile_to_binary(
     })?;
 
     let status = Command::new("cc")
-        .args(["-no-pie", &temp_asm, "-o", output_path])
+        .args(["-no-pie", &temp_asm, "-o", output_path, "-lm"])
         .status()
         .map_err(|e| {
             Diagnostic::error(

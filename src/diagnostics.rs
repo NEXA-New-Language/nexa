@@ -33,10 +33,19 @@ impl Diagnostic {
         let source_line = lines.get(line_idx).copied().unwrap_or("");
 
         let indent = " ".repeat(self.span.col.saturating_sub(1));
-        let width = if self.span.end > self.span.start {
-            (self.span.end - self.span.start).max(1)
+        let line_start: usize = lines.iter().take(line_idx).map(|l| l.len() + 1).sum();
+        let start_in_line = self.span.start.saturating_sub(line_start);
+        let end_in_line = self.span.end.saturating_sub(line_start);
+        let width = if start_in_line <= source_line.len()
+            && end_in_line <= source_line.len()
+            && end_in_line > start_in_line
+        {
+            source_line[start_in_line..end_in_line]
+                .chars()
+                .count()
+                .max(1)
         } else {
-            1
+            self.span.end.saturating_sub(self.span.start).max(1)
         };
         let carets = "^".repeat(width);
 

@@ -282,7 +282,7 @@ impl<'a> Lexer<'a> {
                         Some(other) => {
                             let span = Span::new(
                                 self.current_byte_pos(),
-                                self.current_byte_pos() + 1,
+                                self.current_byte_pos() + other.len_utf8(),
                                 self.line,
                                 self.col,
                             );
@@ -337,7 +337,7 @@ impl<'a> Lexer<'a> {
                 self.advance_char();
             } else if ch == '.'
                 && !is_float
-                && self.peek_next_char().map_or(false, |c| c.is_ascii_digit())
+                && self.peek_next_char().is_some_and(|c| c.is_ascii_digit())
             {
                 is_float = true;
                 self.advance_char();

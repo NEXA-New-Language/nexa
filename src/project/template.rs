@@ -6,6 +6,26 @@ pub struct ProjectTemplate;
 
 impl ProjectTemplate {
     pub fn create_project(target_dir: &Path, name: &str) -> Result<(), String> {
+        validate_project_name(name)?;
+        let manifest_path = target_dir.join("nexa.toml");
+        let main_path = target_dir.join("src/main.nexa");
+        let test_path = target_dir.join("tests/test_main.nexa");
+        let lock_path = target_dir.join("nexa.lock");
+        let gitignore_path = target_dir.join(".gitignore");
+        for path in [
+            &manifest_path,
+            &main_path,
+            &test_path,
+            &lock_path,
+            &gitignore_path,
+        ] {
+            if path.exists() {
+                return Err(format!(
+                    "Error: Refusing to overwrite existing file '{}'.",
+                    path.display()
+                ));
+            }
+        }
         fs::create_dir_all(target_dir).map_err(|e| e.to_string())?;
 
         fs::create_dir_all(target_dir.join("src")).map_err(|e| e.to_string())?;
@@ -83,4 +103,18 @@ version = 1
 
         Ok(())
     }
+}
+
+fn validate_project_name(name: &str) -> Result<(), String> {
+    let first = name.chars().next();
+    if !matches!(first, Some(c) if c.is_ascii_alphabetic()) {
+        return Err("Error: Project name must start with an ASCII letter.".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Error: Project name can only contain alphanumeric characters, underscores, and hyphens.".to_string());
+    }
+    Ok(())
 }

@@ -24,6 +24,12 @@ pub struct LockedPackage {
     pub dependencies: Vec<String>,
 }
 
+impl Default for Lockfile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Lockfile {
     pub fn new() -> Self {
         Self {
@@ -50,6 +56,38 @@ impl Lockfile {
         let full = format!("{}{}", header, body);
         fs::write(path, full)
             .map_err(|e| format!("Failed to write lockfile '{}': {}", path.display(), e))?;
+        Ok(())
+    }
+
+    /// Verify that every expected package is present and unchanged.
+    pub fn verify(&self, expected: &[LockedPackage]) -> Result<(), String> {
+        for want in expected {
+            let found = self.packages.iter().find(|p| p.name == want.name);
+            match found {
+                None => {
+                    return Err(format!(
+                        "Lockfile is missing package '{}'. Run 'nexa update'.",
+                        want.name
+                    ));
+                }
+                Some(got) => {
+                    let mut got_deps = got.dependencies.clone();
+                    let mut want_deps = want.dependencies.clone();
+                    got_deps.sort();
+                    want_deps.sort();
+                    if got.version != want.version
+                        || got.source != want.source
+                        || got.checksum != want.checksum
+                        || got_deps != want_deps
+                    {
+                        return Err(format!(
+                            "Lockfile entry for '{}' is out of date. Run 'nexa update'.",
+                            want.name
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

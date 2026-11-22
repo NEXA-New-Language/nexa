@@ -145,6 +145,7 @@ impl<'a> Parser<'a> {
         let condition = self.parse_expression(0)?;
         let then_branch = self.parse_block()?;
 
+        self.skip_newlines();
         let else_branch = if self.match_token(&TokenKind::Else) {
             if self.check(&TokenKind::If) {
                 let nested_if = self.parse_if_stmt()?;

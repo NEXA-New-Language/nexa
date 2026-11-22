@@ -22,6 +22,18 @@ fn print_usage() {
     println!("  --version, -V    Show NEXA version information");
 }
 
+fn temp_executable(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "nexa-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -51,17 +63,24 @@ fn main() {
                     eprintln!("Error reading '{}': {}", file_path, e);
                     process::exit(1);
                 });
-                let temp_bin = "./__nexa_temp_bin";
-                if let Err(diag) = nexa::compile_to_binary(file_path, &source, temp_bin) {
+                let temp_bin = temp_executable("run");
+                if let Err(diag) =
+                    nexa::compile_to_binary(file_path, &source, temp_bin.to_str().unwrap())
+                {
                     eprint!("{}", diag.render(&source));
                     process::exit(1);
                 }
-                let st = std::process::Command::new(temp_bin).status();
-                let _ = std::fs::remove_file(temp_bin);
-                if let Ok(code) = st {
-                    process::exit(code.code().unwrap_or(0));
+                let st = std::process::Command::new(&temp_bin)
+                    .args(&args[3..])
+                    .status();
+                let _ = std::fs::remove_file(&temp_bin);
+                match st {
+                    Ok(code) => process::exit(code.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("Error: Failed to execute native binary: {}", e);
+                        process::exit(1);
+                    }
                 }
-                return;
             }
             CliHandler::handle_run(release)
         }
@@ -101,14 +120,24 @@ fn main() {
                     eprintln!("Error reading '{}': {}", other, e);
                     process::exit(1);
                 });
-                let temp_bin = "./__nexa_temp_bin";
-                if let Err(diag) = nexa::compile_to_binary(other, &source, temp_bin) {
+                let temp_bin = temp_executable("run");
+                if let Err(diag) =
+                    nexa::compile_to_binary(other, &source, temp_bin.to_str().unwrap())
+                {
                     eprint!("{}", diag.render(&source));
                     process::exit(1);
                 }
-                let _ = std::process::Command::new(temp_bin).status();
-                let _ = std::fs::remove_file(temp_bin);
-                return;
+                let st = std::process::Command::new(&temp_bin)
+                    .args(&args[2..])
+                    .status();
+                let _ = std::fs::remove_file(&temp_bin);
+                match st {
+                    Ok(code) => process::exit(code.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("Error: Failed to execute native binary: {}", e);
+                        process::exit(1);
+                    }
+                }
             }
             eprintln!("Error: Unknown command '{}'.\n", other);
             print_usage();

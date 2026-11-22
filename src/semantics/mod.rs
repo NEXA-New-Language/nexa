@@ -1,25 +1,39 @@
-
 use crate::diagnostics::Diagnostic;
 use crate::span::Span;
 use crate::syntax::ast::*;
 use crate::types::Type;
 use std::collections::HashMap;
 
+/// Type information produced by semantic analysis and consumed by the native
+/// backend. Spans identify AST nodes; binding ids are stable across scopes.
+#[derive(Debug, Clone)]
+pub struct AnalyzedProgram {
+    pub program: Program,
+    pub expr_types: HashMap<Span, Type>,
+    pub bindings: HashMap<Span, usize>,
+    pub slot_types: Vec<Type>,
+    pub repeat_counters: HashMap<Span, usize>,
+    pub actions: HashMap<String, ActionSignature>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionSignature {
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
 #[derive(Clone)]
 struct Variable {
     ty: Type,
     mutable: bool,
-}
-
-#[derive(Clone)]
-struct ActionSignature {
-    params: Vec<Type>,
+    slot: usize,
 }
 
 pub struct SemanticAnalyzer {
     file_name: String,
     scopes: Vec<HashMap<String, Variable>>,
     actions: HashMap<String, ActionSignature>,
+    analyzed: Option<AnalyzedProgram>,
 }
 
 impl SemanticAnalyzer {
@@ -28,15 +42,21 @@ impl SemanticAnalyzer {
             file_name: file_name.into(),
             scopes: vec![HashMap::new()],
             actions: HashMap::new(),
+            analyzed: None,
         }
     }
 
+    /// Compatibility entry point: validate without retaining the typed result.
     pub fn analyze(&mut self, program: &Program) -> Result<(), Diagnostic> {
+        self.analyze_program(program).map(|_| ())
+    }
+
+    pub fn analyze_program(&mut self, program: &Program) -> Result<AnalyzedProgram, Diagnostic> {
         self.scopes.clear();
         self.scopes.push(HashMap::new());
         self.actions.clear();
 
-        // 関数を先に登録し、前方参照を可能にする。
+        let mut declarations = Vec::new();
         for stmt in &program.statements {
             if let Stmt::Action { name, params, .. } = stmt {
                 if name.name == "print" {
@@ -46,7 +66,6 @@ impl SemanticAnalyzer {
                         Some("Choose another action name.".into()),
                     ));
                 }
-
                 if self.actions.contains_key(&name.name) {
                     return Err(self.error(
                         name.span,
@@ -54,7 +73,6 @@ impl SemanticAnalyzer {
                         None,
                     ));
                 }
-
                 let mut names = Vec::new();
                 for param in params {
                     if names.contains(&param.name) {
@@ -66,51 +84,116 @@ impl SemanticAnalyzer {
                     }
                     names.push(param.name.clone());
                 }
-
-                // 現在のネイティブコード生成ではactionの引数は文字列として扱う。
+                declarations.push((name, params.as_slice(), stmt));
                 self.actions.insert(
                     name.name.clone(),
                     ActionSignature {
                         params: vec![Type::String; params.len()],
+                        ret: Type::Void,
                     },
                 );
             }
         }
 
+        let signatures = self.infer_actions(&declarations, program)?;
+        self.actions = signatures;
+
+        let analyzed = AnalyzedProgram {
+            program: program.clone(),
+            expr_types: HashMap::new(),
+            bindings: HashMap::new(),
+            slot_types: Vec::new(),
+            repeat_counters: HashMap::new(),
+            actions: self.actions.clone(),
+        };
+        self.analyzed = Some(analyzed);
+
         for stmt in &program.statements {
             self.analyze_stmt(stmt)?;
         }
 
-        Ok(())
+        Ok(self.analyzed.take().unwrap())
+    }
+
+    fn infer_actions(
+        &self,
+        declarations: &[(&Ident, &[Ident], &Stmt)],
+        program: &Program,
+    ) -> Result<HashMap<String, ActionSignature>, Diagnostic> {
+        let mut solver = Inference::default();
+        for (name, params, _) in declarations {
+            for (index, _) in params.iter().enumerate() {
+                solver.add_param(&name.name, index);
+            }
+        }
+
+        for (name, params, stmt) in declarations {
+            if let Stmt::Action { body, .. } = stmt {
+                let mut ctx = InferCtx {
+                    action: &name.name,
+                    params,
+                    solver: &mut solver,
+                };
+                for statement in &body.statements {
+                    ctx.walk_stmt(statement);
+                }
+            }
+        }
+
+        for stmt in &program.statements {
+            if !matches!(stmt, Stmt::Action { .. }) {
+                let mut ctx = InferCtx {
+                    action: "__top",
+                    params: &[],
+                    solver: &mut solver,
+                };
+                ctx.walk_stmt(stmt);
+            }
+        }
+
+        solver.solve()?;
+
+        let mut result = HashMap::new();
+        for (name, params, _) in declarations {
+            let types = params
+                .iter()
+                .enumerate()
+                .map(|(i, _)| solver.param_type(&name.name, i))
+                .collect();
+            result.insert(
+                name.name.clone(),
+                ActionSignature {
+                    params: types,
+                    ret: Type::Void,
+                },
+            );
+        }
+        Ok(result)
     }
 
     fn analyze_stmt(&mut self, stmt: &Stmt) -> Result<(), Diagnostic> {
         match stmt {
-            Stmt::Let { name, value, .. } => {
+            Stmt::Let { name, value, span } => {
                 let ty = self.analyze_expr(value)?;
-                self.declare(name, ty, false)?;
+                self.declare(name, ty, false, *span)?;
             }
-
-            Stmt::Var { name, value, .. } => {
+            Stmt::Var { name, value, span } => {
                 let ty = self.analyze_expr(value)?;
-                self.declare(name, ty, true)?;
+                self.declare(name, ty, true, *span)?;
             }
-
-            Stmt::Const { name, value, .. } => {
+            Stmt::Const { name, value, span } => {
                 let ty = self.analyze_expr(value)?;
-                self.declare(name, ty, false)?;
+                self.declare(name, ty, false, *span)?;
             }
-
             Stmt::Assign { target, value, .. } => {
                 let value_type = self.analyze_expr(value)?;
-
-                let variable = self.lookup_variable(&target.name)
-                    .ok_or_else(|| self.error(
+                let variable = self.lookup_variable(&target.name).ok_or_else(|| {
+                    self.error(
                         target.span,
                         format!("Undefined variable '{}'.", target.name),
                         Some("Declare the variable before assigning to it.".into()),
-                    ))?;
-
+                    )
+                })?;
                 if !variable.mutable {
                     return Err(self.error(
                         target.span,
@@ -118,18 +201,14 @@ impl SemanticAnalyzer {
                         Some("Use 'var' when the variable needs reassignment.".into()),
                     ));
                 }
-
                 if variable.ty != value_type {
-                    return Err(self.type_error(
-                        target.span,
-                        &variable.ty,
-                        &value_type,
-                    ));
+                    return Err(self.type_error(target.span, &variable.ty, &value_type));
                 }
+                self.record_binding(target.span, variable.slot);
             }
-
-            Stmt::Action { name, params, body, .. } => {
-                // actionはトップレベルでのみ宣言可能。
+            Stmt::Action {
+                name, params, body, ..
+            } => {
                 if self.scopes.len() != 1 {
                     return Err(self.error(
                         name.span,
@@ -137,20 +216,16 @@ impl SemanticAnalyzer {
                         None,
                     ));
                 }
-
+                let signature = self.actions.get(&name.name).cloned().unwrap();
                 self.push_scope();
-
-                for param in params {
-                    self.declare(param, Type::String, true)?;
+                for (param, ty) in params.iter().zip(signature.params.iter()) {
+                    self.declare(param, ty.clone(), true, param.span)?;
                 }
-
                 for statement in &body.statements {
                     self.analyze_stmt(statement)?;
                 }
-
                 self.pop_scope();
             }
-
             Stmt::If {
                 condition,
                 then_branch,
@@ -159,69 +234,66 @@ impl SemanticAnalyzer {
             } => {
                 let condition_type = self.analyze_expr(condition)?;
                 self.require_type(&condition_type, &Type::Bool, condition.span())?;
-
                 self.analyze_block(then_branch)?;
-
                 if let Some(block) = else_branch {
                     self.analyze_block(block)?;
                 }
             }
-
-            Stmt::While { condition, body, .. } => {
+            Stmt::While {
+                condition, body, ..
+            } => {
                 let condition_type = self.analyze_expr(condition)?;
                 self.require_type(&condition_type, &Type::Bool, condition.span())?;
                 self.analyze_block(body)?;
             }
-
-            Stmt::Repeat { count, body, .. } => {
+            Stmt::Repeat { count, body, span } => {
                 let count_type = self.analyze_expr(count)?;
                 self.require_type(&count_type, &Type::Int, count.span())?;
+                let slot = self.new_slot(Type::Int);
+                self.analyzed
+                    .as_mut()
+                    .unwrap()
+                    .repeat_counters
+                    .insert(*span, slot);
                 self.analyze_block(body)?;
             }
-
             Stmt::Expr(expr) => {
                 self.analyze_expr(expr)?;
             }
         }
-
         Ok(())
     }
 
     fn analyze_block(&mut self, block: &Block) -> Result<(), Diagnostic> {
         self.push_scope();
-
         for stmt in &block.statements {
             self.analyze_stmt(stmt)?;
         }
-
         self.pop_scope();
         Ok(())
     }
 
     fn analyze_expr(&mut self, expr: &Expr) -> Result<Type, Diagnostic> {
-        match expr {
-            Expr::Literal { lit, .. } => {
-                Ok(match lit {
-                    Literal::Int(_) => Type::Int,
-                    Literal::Float(_) => Type::Float,
-                    Literal::Str(_) => Type::String,
-                    Literal::Bool(_) => Type::Bool,
-                })
-            }
-
+        let ty = match expr {
+            Expr::Literal { lit, .. } => match lit {
+                Literal::Int(_) => Type::Int,
+                Literal::Float(_) => Type::Float,
+                Literal::Str(_) => Type::String,
+                Literal::Bool(_) => Type::Bool,
+            },
             Expr::Variable { name } => {
-                self.lookup_variable(&name.name)
-                    .map(|variable| variable.ty)
-                    .ok_or_else(|| self.error(
+                let variable = self.lookup_variable(&name.name).ok_or_else(|| {
+                    self.error(
                         name.span,
                         format!("Undefined variable '{}'.", name.name),
                         Some("Declare the variable before using it.".into()),
-                    ))
+                    )
+                })?;
+                self.record_binding(name.span, variable.slot);
+                variable.ty
             }
-
             Expr::Unary { op, expr, span } => {
                 let operand = self.analyze_expr(expr)?;
-
                 match op {
                     UnaryOp::Negate => {
                         if operand != Type::Int && operand != Type::Float {
@@ -231,91 +303,82 @@ impl SemanticAnalyzer {
                                 None,
                             ));
                         }
-                        Ok(operand)
+                        operand
                     }
-
                     UnaryOp::Not => {
                         self.require_type(&operand, &Type::Bool, *span)?;
-                        Ok(Type::Bool)
+                        Type::Bool
                     }
                 }
             }
-
-            Expr::Binary { left, op, right, span } => {
+            Expr::Binary {
+                left,
+                op,
+                right,
+                span,
+            } => {
                 let left_type = self.analyze_expr(left)?;
                 let right_type = self.analyze_expr(right)?;
-
                 match op {
                     BinaryOp::Add => {
                         if left_type == Type::String && right_type == Type::String {
-                            Ok(Type::String)
+                            Type::String
                         } else if left_type == right_type
                             && (left_type == Type::Int || left_type == Type::Float)
                         {
-                            Ok(left_type)
+                            left_type
                         } else {
-                            Err(self.error(
+                            return Err(self.error(
                                 *span,
                                 "Addition requires two values of the same numeric type or two strings.",
                                 None,
-                            ))
+                            ));
                         }
                     }
-
-                    BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Mod => {
+                    BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                         if left_type == right_type
                             && (left_type == Type::Int || left_type == Type::Float)
                         {
-                            Ok(left_type)
+                            left_type
                         } else {
-                            Err(self.error(
+                            return Err(self.error(
                                 *span,
                                 "Arithmetic operation requires matching numeric types.",
                                 None,
-                            ))
+                            ));
                         }
                     }
-
                     BinaryOp::Equal | BinaryOp::NotEqual => {
-                        if left_type == right_type {
-                            Ok(Type::Bool)
+                        if left_type == right_type && left_type != Type::Void {
+                            Type::Bool
                         } else {
-                            Err(self.error(
+                            return Err(self.error(
                                 *span,
-                                "Equality comparison requires matching types.",
+                                "Equality comparison requires matching non-void types.",
                                 None,
-                            ))
+                            ));
                         }
                     }
-
-                    BinaryOp::Less
-                    | BinaryOp::LessEq
-                    | BinaryOp::Greater
-                    | BinaryOp::GreaterEq => {
+                    BinaryOp::Less | BinaryOp::LessEq | BinaryOp::Greater | BinaryOp::GreaterEq => {
                         if left_type == right_type
                             && (left_type == Type::Int || left_type == Type::Float)
                         {
-                            Ok(Type::Bool)
+                            Type::Bool
                         } else {
-                            Err(self.error(
+                            return Err(self.error(
                                 *span,
                                 "Comparison requires matching numeric types.",
                                 None,
-                            ))
+                            ));
                         }
                     }
-
                     BinaryOp::And | BinaryOp::Or => {
                         self.require_type(&left_type, &Type::Bool, left.span())?;
                         self.require_type(&right_type, &Type::Bool, right.span())?;
-                        Ok(Type::Bool)
+                        Type::Bool
                     }
                 }
             }
-
             Expr::Call { callee, args, span } => {
                 if callee.name == "print" {
                     if args.len() != 1 {
@@ -325,52 +388,47 @@ impl SemanticAnalyzer {
                             Some("Example: print(\"Hello\")".into()),
                         ));
                     }
-
                     let argument_type = self.analyze_expr(&args[0])?;
-
                     if argument_type == Type::Void {
+                        return Err(self.error(args[0].span(), "Cannot print a void value.", None));
+                    }
+                    Type::Void
+                } else {
+                    let signature = self.actions.get(&callee.name).cloned().ok_or_else(|| {
+                        self.error(
+                            callee.span,
+                            format!("Undefined action '{}'.", callee.name),
+                            None,
+                        )
+                    })?;
+                    if args.len() != signature.params.len() {
                         return Err(self.error(
-                            args[0].span(),
-                            "Cannot print a void value.",
+                            *span,
+                            format!(
+                                "Action '{}' expects {} arguments, but received {}.",
+                                callee.name,
+                                signature.params.len(),
+                                args.len()
+                            ),
                             None,
                         ));
                     }
-
-                    return Ok(Type::Void);
-                }
-
-                let signature = self.actions.get(&callee.name)
-                    .cloned()
-                    .ok_or_else(|| self.error(
-                        callee.span,
-                        format!("Undefined action '{}'.", callee.name),
-                        None,
-                    ))?;
-
-                if args.len() != signature.params.len() {
-                    return Err(self.error(
-                        *span,
-                        format!(
-                            "Action '{}' expects {} arguments, but received {}.",
-                            callee.name,
-                            signature.params.len(),
-                            args.len()
-                        ),
-                        None,
-                    ));
-                }
-
-                for (arg, expected) in args.iter().zip(signature.params.iter()) {
-                    let actual = self.analyze_expr(arg)?;
-
-                    if &actual != expected {
-                        return Err(self.type_error(arg.span(), expected, &actual));
+                    for (arg, expected) in args.iter().zip(signature.params.iter()) {
+                        let actual = self.analyze_expr(arg)?;
+                        if &actual != expected {
+                            return Err(self.type_error(arg.span(), expected, &actual));
+                        }
                     }
+                    Type::Void
                 }
-
-                Ok(Type::Void)
             }
-        }
+        };
+        self.analyzed
+            .as_mut()
+            .unwrap()
+            .expr_types
+            .insert(expr.span(), ty.clone());
+        Ok(ty)
     }
 
     fn declare(
@@ -378,69 +436,66 @@ impl SemanticAnalyzer {
         name: &Ident,
         ty: Type,
         mutable: bool,
+        _span: Span,
     ) -> Result<(), Diagnostic> {
-        // 現在のコード生成との名前解決の不一致を避けるため、
-        // 有効なスコープ内での変数名の再宣言を禁止する。
-        if self.scopes.iter().any(|scope| scope.contains_key(&name.name)) {
+        if self
+            .scopes
+            .iter()
+            .any(|scope| scope.contains_key(&name.name))
+        {
             return Err(self.error(
                 name.span,
                 format!("Variable '{}' is already declared.", name.name),
                 None,
             ));
         }
-
-        self.scopes.last_mut().unwrap().insert(
-            name.name.clone(),
-            Variable { ty, mutable },
-        );
-
+        let slot = self.new_slot(ty.clone());
+        self.record_binding(name.span, slot);
+        self.scopes
+            .last_mut()
+            .unwrap()
+            .insert(name.name.clone(), Variable { ty, mutable, slot });
         Ok(())
     }
 
+    fn new_slot(&mut self, ty: Type) -> usize {
+        let analyzed = self.analyzed.as_mut().unwrap();
+        let slot = analyzed.slot_types.len();
+        analyzed.slot_types.push(ty);
+        slot
+    }
+
+    fn record_binding(&mut self, span: Span, slot: usize) {
+        self.analyzed.as_mut().unwrap().bindings.insert(span, slot);
+    }
+
     fn lookup_variable(&self, name: &str) -> Option<Variable> {
-        self.scopes.iter()
+        self.scopes
+            .iter()
             .rev()
             .find_map(|scope| scope.get(name).cloned())
     }
 
-    fn require_type(
-        &self,
-        actual: &Type,
-        expected: &Type,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
+    fn require_type(&self, actual: &Type, expected: &Type, span: Span) -> Result<(), Diagnostic> {
         if actual != expected {
             return Err(self.type_error(span, expected, actual));
         }
         Ok(())
     }
 
-    fn type_error(
-        &self,
-        span: Span,
-        expected: &Type,
-        actual: &Type,
-    ) -> Diagnostic {
+    fn type_error(&self, span: Span, expected: &Type, actual: &Type) -> Diagnostic {
         self.error(
             span,
-            format!("Type mismatch: expected {:?}, found {:?}.", expected, actual),
+            format!(
+                "Type mismatch: expected {:?}, found {:?}.",
+                expected, actual
+            ),
             None,
         )
     }
 
-    fn error(
-        &self,
-        span: Span,
-        message: impl Into<String>,
-        hint: Option<String>,
-    ) -> Diagnostic {
-        Diagnostic::error(
-            "Semantic Error",
-            &self.file_name,
-            span,
-            message,
-            hint,
-        )
+    fn error(&self, span: Span, message: impl Into<String>, hint: Option<String>) -> Diagnostic {
+        Diagnostic::error("Semantic Error", &self.file_name, span, message, hint)
     }
 
     fn push_scope(&mut self) {
@@ -451,5 +506,401 @@ impl SemanticAnalyzer {
         if self.scopes.len() > 1 {
             self.scopes.pop();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monomorphic parameter inference for the existing untyped action syntax.
+// Parameters default to String unless numeric/boolean use or a call constrains
+// them. This preserves the historical `greet(target)` string behavior while
+// allowing numeric actions without introducing type-annotation syntax.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Inference {
+    parent: Vec<usize>,
+    ty: Vec<Option<Type>>,
+    numeric: Vec<bool>,
+    allow_call_constraints: Vec<bool>,
+    ids: HashMap<(String, usize), usize>,
+    constraints: Vec<(usize, Type, Span)>,
+    conflicts: Vec<(Type, Type, Span)>,
+}
+
+impl Inference {
+    fn add_param(&mut self, action: &str, index: usize) {
+        let id = self.parent.len();
+        self.parent.push(id);
+        self.ty.push(None);
+        self.numeric.push(false);
+        self.allow_call_constraints.push(false);
+        self.ids.insert((action.to_string(), index), id);
+    }
+
+    fn find(&mut self, id: usize) -> usize {
+        if self.parent[id] != id {
+            let root = self.find(self.parent[id]);
+            self.parent[id] = root;
+        }
+        self.parent[id]
+    }
+
+    fn link(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra == rb {
+            return;
+        }
+        if let (Some(a), Some(b)) = (&self.ty[ra], &self.ty[rb]) {
+            if a != b {
+                self.conflicts
+                    .push((a.clone(), b.clone(), Span::new(0, 0, 1, 1)));
+            }
+        }
+        self.parent[rb] = ra;
+        self.numeric[ra] |= self.numeric[rb];
+        self.allow_call_constraints[ra] |= self.allow_call_constraints[rb];
+        if self.ty[ra].is_none() {
+            self.ty[ra] = self.ty[rb].clone();
+        }
+    }
+
+    fn constrain(&mut self, id: usize, ty: Type, span: Span) {
+        let root = self.find(id);
+        self.allow_call_constraints[root] = true;
+        self.constraints.push((id, ty, span));
+    }
+
+    fn constrain_call(&mut self, id: usize, ty: Type, span: Span) {
+        self.constraints.push((id, ty, span));
+    }
+
+    fn allow_call(&mut self, id: usize) {
+        let root = self.find(id);
+        self.allow_call_constraints[root] = true;
+    }
+
+    fn mark_numeric(&mut self, id: usize) {
+        let root = self.find(id);
+        self.numeric[root] = true;
+    }
+
+    fn solve(&mut self) -> Result<(), Diagnostic> {
+        if let Some((a, b, span)) = self.conflicts.first() {
+            return Err(Diagnostic::error(
+                "Semantic Error",
+                "<inference>",
+                *span,
+                format!(
+                    "Action parameter is used with incompatible types: {:?} and {:?}.",
+                    a, b
+                ),
+                Some("Use separate actions for different parameter types.".into()),
+            ));
+        }
+        for (id, ty, span) in std::mem::take(&mut self.constraints) {
+            let root = self.find(id);
+            if let Some(existing) = &self.ty[root] {
+                if existing != &ty {
+                    return Err(Diagnostic::error(
+                        "Semantic Error",
+                        "<inference>",
+                        span,
+                        format!(
+                            "Action parameter is used with incompatible types: {:?} and {:?}.",
+                            existing, ty
+                        ),
+                        Some("Use separate actions for different parameter types.".into()),
+                    ));
+                }
+            } else {
+                self.ty[root] = Some(ty);
+            }
+        }
+        for i in 0..self.parent.len() {
+            let root = self.find(i);
+            if self.numeric[root] {
+                match &self.ty[root] {
+                    None => self.ty[root] = Some(Type::Int),
+                    Some(Type::Int) | Some(Type::Float) => {}
+                    Some(other) => {
+                        return Err(Diagnostic::error(
+                            "Semantic Error",
+                            "<inference>",
+                            Span::new(0, 0, 1, 1),
+                            format!(
+                                "Action parameter of type {:?} cannot be used numerically.",
+                                other
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn param_type(&self, action: &str, index: usize) -> Type {
+        let id = self.ids[&(action.to_string(), index)];
+        let mut root = id;
+        while self.parent[root] != root {
+            root = self.parent[root];
+        }
+        self.ty[root].clone().unwrap_or(Type::String)
+    }
+}
+
+struct InferCtx<'a> {
+    action: &'a str,
+    params: &'a [Ident],
+    solver: &'a mut Inference,
+}
+
+impl<'a> InferCtx<'a> {
+    fn param_id(&self, name: &str) -> Option<usize> {
+        self.params
+            .iter()
+            .position(|p| p.name == name)
+            .and_then(|i| self.solver.ids.get(&(self.action.to_string(), i)).copied())
+    }
+
+    fn walk_stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Let { value, .. } | Stmt::Var { value, .. } | Stmt::Const { value, .. } => {
+                self.walk_expr(value);
+            }
+            Stmt::Assign { target, value, .. } => {
+                self.walk_expr(value);
+                if let Some(id) = self.param_id(&target.name) {
+                    if let Some(t) = self.simple_type(value) {
+                        self.solver.constrain(id, t, target.span);
+                    }
+                }
+            }
+            Stmt::Expr(expr) => self.walk_expr(expr),
+            Stmt::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.walk_expr(condition);
+                if let Some(id) = variable_param(condition).and_then(|n| self.param_id(n)) {
+                    self.solver.constrain(id, Type::Bool, condition.span());
+                }
+                for s in &then_branch.statements {
+                    self.walk_stmt(s);
+                }
+                if let Some(block) = else_branch {
+                    for s in &block.statements {
+                        self.walk_stmt(s);
+                    }
+                }
+            }
+            Stmt::While {
+                condition, body, ..
+            } => {
+                self.walk_expr(condition);
+                if let Some(id) = variable_param(condition).and_then(|n| self.param_id(n)) {
+                    self.solver.constrain(id, Type::Bool, condition.span());
+                }
+                for s in &body.statements {
+                    self.walk_stmt(s);
+                }
+            }
+            Stmt::Repeat { count, body, .. } => {
+                self.walk_expr(count);
+                if let Some(id) = variable_param(count).and_then(|n| self.param_id(n)) {
+                    self.solver.constrain(id, Type::Int, count.span());
+                }
+                for s in &body.statements {
+                    self.walk_stmt(s);
+                }
+            }
+            Stmt::Action { .. } => {}
+        }
+    }
+
+    fn walk_expr(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Unary { op, expr, .. } => {
+                self.walk_expr(expr);
+                if let Expr::Variable { name } = expr.as_ref() {
+                    if let Some(id) = self.param_id(&name.name) {
+                        match op {
+                            UnaryOp::Negate => self.solver.mark_numeric(id),
+                            UnaryOp::Not => self.solver.constrain(id, Type::Bool, name.span),
+                        }
+                    }
+                }
+            }
+            Expr::Binary {
+                left, op, right, ..
+            } => {
+                self.walk_expr(left);
+                self.walk_expr(right);
+                let numeric = matches!(
+                    op,
+                    BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Mod
+                        | BinaryOp::Less
+                        | BinaryOp::LessEq
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEq
+                );
+                let lid = variable_param(left).and_then(|n| self.param_id(n));
+                let rid = variable_param(right).and_then(|n| self.param_id(n));
+                if numeric {
+                    if let Some(id) = lid {
+                        self.solver.mark_numeric(id);
+                    }
+                    if let Some(id) = rid {
+                        self.solver.mark_numeric(id);
+                    }
+                    if let Some(t) = self.simple_type(left) {
+                        if matches!(t, Type::Int | Type::Float) {
+                            if let Some(id) = rid {
+                                self.solver.constrain(id, t, left.span());
+                            }
+                        }
+                    }
+                    if let Some(t) = self.simple_type(right) {
+                        if matches!(t, Type::Int | Type::Float) {
+                            if let Some(id) = lid {
+                                self.solver.constrain(id, t, right.span());
+                            }
+                        }
+                    }
+                }
+                if matches!(op, BinaryOp::Equal | BinaryOp::NotEqual) {
+                    if let Some(t) = self.simple_type(left) {
+                        if let Some(id) = rid {
+                            self.solver.constrain(id, t, left.span());
+                        }
+                    }
+                    if let Some(t) = self.simple_type(right) {
+                        if let Some(id) = lid {
+                            self.solver.constrain(id, t, right.span());
+                        }
+                    }
+                }
+                if *op == BinaryOp::Add {
+                    if let Some(t) = self.simple_type(left) {
+                        if let Some(id) = rid {
+                            self.solver.constrain(id, t, right.span());
+                        }
+                    }
+                    if let Some(t) = self.simple_type(right) {
+                        if let Some(id) = lid {
+                            self.solver.constrain(id, t, left.span());
+                        }
+                    }
+                }
+                if *op == BinaryOp::Add {
+                    for id in self
+                        .add_param_ids(left)
+                        .into_iter()
+                        .chain(self.add_param_ids(right))
+                    {
+                        self.solver.allow_call(id);
+                    }
+                }
+                if let (Some(a), Some(b)) = (lid, rid) {
+                    self.solver.link(a, b);
+                }
+                if matches!(op, BinaryOp::And | BinaryOp::Or) {
+                    if let Some(id) = lid {
+                        self.solver.constrain(id, Type::Bool, left.span());
+                    }
+                    if let Some(id) = rid {
+                        self.solver.constrain(id, Type::Bool, right.span());
+                    }
+                }
+            }
+            Expr::Call { callee, args, .. } => {
+                for arg in args {
+                    self.walk_expr(arg);
+                }
+                if callee.name == "print" {
+                    return;
+                }
+                for (index, arg) in args.iter().enumerate() {
+                    let target = self.solver.ids.get(&(callee.name.clone(), index)).copied();
+                    if let Some(target) = target {
+                        if let Some(t) = self.simple_type(arg) {
+                            self.solver.constrain_call(target, t, arg.span());
+                        }
+                        if let Some(name) = variable_param(arg) {
+                            if let Some(source) = self.param_id(name) {
+                                self.solver.link(source, target);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn add_param_ids(&self, expr: &Expr) -> Vec<usize> {
+        let mut ids = Vec::new();
+        match expr {
+            Expr::Variable { name } => {
+                if let Some(id) = self.param_id(&name.name) {
+                    ids.push(id);
+                }
+            }
+            Expr::Binary { left, right, .. } => {
+                ids.extend(self.add_param_ids(left));
+                ids.extend(self.add_param_ids(right));
+            }
+            Expr::Unary { expr, .. } => ids.extend(self.add_param_ids(expr)),
+            _ => {}
+        }
+        ids
+    }
+
+    fn simple_type(&self, expr: &Expr) -> Option<Type> {
+        match expr {
+            Expr::Literal { lit, .. } => Some(match lit {
+                Literal::Int(_) => Type::Int,
+                Literal::Float(_) => Type::Float,
+                Literal::Str(_) => Type::String,
+                Literal::Bool(_) => Type::Bool,
+            }),
+            Expr::Unary { op, expr, .. } => self.simple_type(expr).map(|t| match op {
+                UnaryOp::Not => Type::Bool,
+                UnaryOp::Negate => t,
+            }),
+            Expr::Binary {
+                left, op, right, ..
+            } => {
+                let l = self.simple_type(left)?;
+                let r = self.simple_type(right)?;
+                if l != r {
+                    return None;
+                }
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod => Some(l),
+                    _ => Some(Type::Bool),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+fn variable_param(expr: &Expr) -> Option<&str> {
+    if let Expr::Variable { name } = expr {
+        Some(&name.name)
+    } else {
+        None
     }
 }

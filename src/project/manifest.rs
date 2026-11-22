@@ -148,6 +148,22 @@ impl Manifest {
             ));
         }
 
+        if self.language.version != "1.0" && self.language.version != "1.0.0" {
+            return Err(format!(
+                "Error: Unsupported language version '{}' in {}\nSupported language version: '1.0'.",
+                self.language.version, filename
+            ));
+        }
+
+        validate_relative_path("build.entry", &self.build.entry, &filename)?;
+        validate_relative_path("build.output", &self.build.output, &filename)?;
+        if self.build.output == "." || self.build.output.is_empty() {
+            return Err(format!(
+                "Error: Invalid build.output '{}' in {}\nOutput must be a project-relative build directory.",
+                self.build.output, filename
+            ));
+        }
+
         Ok(())
     }
 
@@ -158,4 +174,31 @@ impl Manifest {
             .map_err(|e| format!("Failed to write manifest to '{}': {}", path.display(), e))?;
         Ok(())
     }
+}
+
+fn validate_relative_path(field: &str, value: &str, filename: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("Error: {} cannot be empty in {}", field, filename));
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(format!(
+            "Error: {} must be a relative path in {} (found '{}').",
+            field, filename, value
+        ));
+    }
+    for comp in path.components() {
+        if matches!(
+            comp,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        ) {
+            return Err(format!(
+                "Error: {} must stay inside the project directory in {} (found '{}').",
+                field, filename, value
+            ));
+        }
+    }
+    Ok(())
 }

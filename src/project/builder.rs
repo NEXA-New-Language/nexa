@@ -1,4 +1,5 @@
 use crate::compile_to_assembly;
+use crate::project::dependency::DependencyManager;
 use crate::project::lockfile::{LockedPackage, Lockfile};
 use crate::project::manifest::Manifest;
 use std::fs;
@@ -12,6 +13,7 @@ pub enum BuildMode {
     Release,
 }
 
+#[derive(Debug)]
 pub struct BuildResult {
     pub binary_path: PathBuf,
     pub mode: BuildMode,
@@ -42,6 +44,16 @@ impl NativeBuilder {
                 e
             )
         })?;
+
+        let resolved = DependencyManager::resolve_all(&manifest, project_dir)?;
+        let lock_path = project_dir.join("nexa.lock");
+        let mut lockfile = Lockfile::load(&lock_path)?.unwrap_or_else(Lockfile::new);
+        let expected_deps = locked_dependencies(&resolved)?;
+        if lockfile.packages.is_empty() {
+            lockfile.packages.extend(expected_deps.clone());
+        } else {
+            lockfile.verify(&expected_deps)?;
+        }
 
         let mode_subdir = match mode {
             BuildMode::Debug => "debug",
@@ -83,7 +95,7 @@ impl NativeBuilder {
         }
         let temp_asm_str = temp_asm_path.to_str().unwrap();
         let binary_str = binary_path.to_str().unwrap();
-        cc_args.extend(["-o", binary_str, temp_asm_str]);
+        cc_args.extend(["-o", binary_str, temp_asm_str, "-lm"]);
 
         let status = Command::new("cc")
             .args(&cc_args)
@@ -96,8 +108,6 @@ impl NativeBuilder {
             return Err("Linker Error: Failed to generate native executable.".to_string());
         }
 
-        let lock_path = project_dir.join("nexa.lock");
-        let mut lockfile = Lockfile::load(&lock_path)?.unwrap_or_else(Lockfile::new);
         let checksum = Lockfile::compute_checksum(source.as_bytes());
 
         lockfile
@@ -110,6 +120,7 @@ impl NativeBuilder {
             checksum,
             dependencies: manifest.dependencies.keys().cloned().collect(),
         });
+        lockfile.packages.sort_by(|a, b| a.name.cmp(&b.name));
         lockfile.save(&lock_path)?;
 
         let metadata = fs::metadata(&binary_path).map_err(|e| e.to_string())?;
@@ -122,4 +133,27 @@ impl NativeBuilder {
             binary_size: metadata.len(),
         })
     }
+}
+
+pub(crate) fn locked_dependencies(
+    resolved: &[crate::project::dependency::ResolvedDependency],
+) -> Result<Vec<LockedPackage>, String> {
+    let mut packages = Vec::new();
+    for dep in resolved {
+        let content = fs::read(&dep.entry).map_err(|e| {
+            format!(
+                "Failed to read dependency entry '{}': {}",
+                dep.entry.display(),
+                e
+            )
+        })?;
+        packages.push(LockedPackage {
+            name: dep.name.clone(),
+            version: dep.version.clone(),
+            source: dep.source_desc.clone(),
+            checksum: Lockfile::compute_checksum(&content),
+            dependencies: dep.dependencies.clone(),
+        });
+    }
+    Ok(packages)
 }

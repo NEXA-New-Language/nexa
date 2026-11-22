@@ -256,29 +256,26 @@ impl CliHandler {
         let (manifest, _) = Manifest::load_from_dir(&project_dir)?;
         let lock_path = project_dir.join("nexa.lock");
 
-        let mut lockfile = Lockfile::new();
         let resolved = DependencyManager::resolve_all(&manifest, &project_dir)?;
+        let mut lockfile = Lockfile::new();
+        lockfile
+            .packages
+            .extend(crate::project::builder::locked_dependencies(&resolved)?);
 
-        for dep in resolved {
-            let dep_entry = dep.path.join("src/main.nexa");
-            let checksum = if dep_entry.exists() {
-                let content = fs::read(&dep_entry).unwrap_or_default();
-                Lockfile::compute_checksum(&content)
-            } else {
-                "0000000000000000".to_string()
-            };
-
+        let entry_path = project_dir.join(&manifest.build.entry);
+        if entry_path.exists() {
+            let content = fs::read(&entry_path).map_err(|e| e.to_string())?;
             lockfile
                 .packages
                 .push(crate::project::lockfile::LockedPackage {
-                    name: dep.name,
-                    version: dep.version,
-                    source: dep.source_desc,
-                    checksum,
-                    dependencies: Vec::new(),
+                    name: manifest.project.name.clone(),
+                    version: manifest.project.version.clone(),
+                    source: "root".to_string(),
+                    checksum: Lockfile::compute_checksum(&content),
+                    dependencies: manifest.dependencies.keys().cloned().collect(),
                 });
         }
-
+        lockfile.packages.sort_by(|a, b| a.name.cmp(&b.name));
         lockfile.save(&lock_path)?;
         println!("     Updated nexa.lock");
         Ok(())

@@ -17,11 +17,16 @@ impl Span {
     }
 
     pub fn to(self, other: Span) -> Self {
+        let first = if other.start < self.start {
+            other
+        } else {
+            self
+        };
         Self {
             start: self.start.min(other.start),
             end: self.end.max(other.end),
-            line: self.line,
-            col: self.col,
+            line: first.line,
+            col: first.col,
         }
     }
 }

@@ -1,6 +1,5 @@
 use nexa::project::lockfile::Lockfile;
 use nexa::project::manifest::Manifest;
-use std::fs;
 use std::path::Path;
 
 #[test]
