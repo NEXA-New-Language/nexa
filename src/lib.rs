@@ -134,7 +134,13 @@ fn link_attempt(
     extra_cc_args: &[&str],
     with_gtk: bool,
 ) -> Result<(), String> {
-    let mut args: Vec<String> = vec!["-no-pie".to_string()];
+    let mut args: Vec<String> = vec![
+        // Position-independent executable with full RELRO and an
+        // immediate binding of lazy symbols (hardening; see README).
+        "-pie".to_string(),
+        "-fPIE".to_string(),
+        "-Wl,-z,relro,-z,now,-z,noexecstack".to_string(),
+    ];
     args.extend(extra_cc_args.iter().map(|a| a.to_string()));
     if let Some(runtime) = runtime_path {
         if !with_gtk {

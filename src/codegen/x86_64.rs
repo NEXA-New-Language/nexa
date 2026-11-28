@@ -432,14 +432,20 @@ impl<'a> GenCtx<'a> {
                 // `x = x + 0` is a no-op; anything else is one instruction.
                 if c != 0 {
                     let instr = if is_add { "add" } else { "sub" };
-                    out.push_str(&format!("    {} qword ptr {}, {}\n", instr, loc, c));
+                    out.push_str(&format!(
+                        "    {} qword ptr {}, {}\n    jo __nexa_int_overflow\n",
+                        instr, loc, c
+                    ));
                 }
                 true
             }
             _ => {
                 self.gen_expr(other, 0, out);
                 let instr = if is_add { "add" } else { "sub" };
-                out.push_str(&format!("    {} qword ptr {}, rax\n", instr, loc));
+                out.push_str(&format!(
+                    "    {} qword ptr {}, rax\n    jo __nexa_int_overflow\n",
+                    instr, loc
+                ));
                 true
             }
         }
@@ -1120,7 +1126,9 @@ impl<'a> GenCtx<'a> {
                             "    movsd xmm1, [rip + .LC_sign_mask]\n    xorpd xmm0, xmm1\n",
                         );
                     }
-                    UnaryOp::Negate => out.push_str("    neg rax\n"),
+                    UnaryOp::Negate => {
+                        out.push_str("    neg rax\n    jo __nexa_int_overflow\n")
+                    }
                     UnaryOp::Not => {
                         out.push_str("    test rax, rax\n    sete al\n    movzx rax, al\n")
                     }
@@ -1241,9 +1249,15 @@ impl<'a> GenCtx<'a> {
                 }
 
                 match op {
-                    BinaryOp::Add => out.push_str("    add rax, rbx\n"),
-                    BinaryOp::Sub => out.push_str("    sub rax, rbx\n"),
-                    BinaryOp::Mul => out.push_str("    imul rax, rbx\n"),
+                    BinaryOp::Add => out.push_str(
+                        "    add rax, rbx\n    jo __nexa_int_overflow\n",
+                    ),
+                    BinaryOp::Sub => out.push_str(
+                        "    sub rax, rbx\n    jo __nexa_int_overflow\n",
+                    ),
+                    BinaryOp::Mul => out.push_str(
+                        "    imul rax, rbx\n    jo __nexa_int_overflow\n",
+                    ),
                     BinaryOp::Div => {
                         out.push_str("    mov rdi, rax\n    mov rsi, rbx\n    call __nexa_div\n")
                     }
@@ -1751,6 +1765,13 @@ __nexa_mod:
     mov rsi, 26
     call __nexa_runtime_error
 
+.globl __nexa_int_overflow
+__nexa_int_overflow:
+    sub rsp, 8
+    lea rdi, [rip + .Lerr_int_overflow]
+    mov rsi, 17
+    call __nexa_runtime_error
+
 .globl __nexa_str_eq
 __nexa_str_eq:
     sub rsp, 8
@@ -1856,6 +1877,9 @@ __nexa_print_bool:
 .Lerr_div_overflow:
     .ascii "integer division overflow\n"
 .Lerr_div_overflow_len = . - .Lerr_div_overflow
+.Lerr_int_overflow:
+    .ascii "integer overflow\n"
+.Lerr_int_overflow_len = . - .Lerr_int_overflow
 .Lerr_str_size:
     .ascii "string concatenation overflow\n"
 .Lerr_str_size_len = . - .Lerr_str_size
@@ -1890,7 +1914,7 @@ fn const_eval(expr: &Expr) -> Option<ConstVal> {
         Expr::Unary { op, expr, .. } => {
             let v = const_eval(expr)?;
             match (op, v) {
-                (UnaryOp::Negate, ConstVal::Int(v)) => Some(ConstVal::Int(v.wrapping_neg())),
+                (UnaryOp::Negate, ConstVal::Int(v)) => Some(ConstVal::Int(v.checked_neg()?)),
                 (UnaryOp::Negate, ConstVal::Float(v)) => Some(ConstVal::Float(-v)),
                 (UnaryOp::Not, ConstVal::Bool(v)) => Some(ConstVal::Bool(!v)),
                 _ => None,
@@ -1913,9 +1937,9 @@ fn const_eval(expr: &Expr) -> Option<ConstVal> {
             let r = const_eval(right)?;
             match (l, r) {
                 (ConstVal::Int(a), ConstVal::Int(b)) => match op {
-                    BinaryOp::Add => Some(ConstVal::Int(a.wrapping_add(b))),
-                    BinaryOp::Sub => Some(ConstVal::Int(a.wrapping_sub(b))),
-                    BinaryOp::Mul => Some(ConstVal::Int(a.wrapping_mul(b))),
+                    BinaryOp::Add => Some(ConstVal::Int(a.checked_add(b)?)),
+                    BinaryOp::Sub => Some(ConstVal::Int(a.checked_sub(b)?)),
+                    BinaryOp::Mul => Some(ConstVal::Int(a.checked_mul(b)?)),
                     BinaryOp::Div => Some(ConstVal::Int(a.checked_div(b)?)),
                     BinaryOp::Mod => Some(ConstVal::Int(a.checked_rem(b)?)),
                     BinaryOp::Equal => Some(ConstVal::Bool(a == b)),

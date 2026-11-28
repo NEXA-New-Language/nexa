@@ -190,6 +190,28 @@ On the 10,000,000-iteration summation loop used for benchmarking, these
 bring the release binary from about 20 ms to about 12 ms, on par with
 `g++ -O2` for the same loop.
 
+## Security
+
+Generated native binaries are hardened by default:
+
+- **Checked integer arithmetic.** Signed `+`, `-`, `*`, unary `-`,
+  and in-place `x = x ± e` trap at runtime on overflow instead of
+  silently wrapping: the program prints `integer overflow` to stderr
+  and exits with status 1 (same mechanism as the pre-existing
+  divide-by-zero and division-overflow checks). The constant folder
+  uses checked arithmetic too, so an overflowing constant expression
+  is never silently folded into a wrong value.
+- **Position-independent executables.** Binaries link as PIE with
+  full RELRO (`-z relro -z now`), a non-executable stack, and the UI
+  runtime compiled with `-fPIE`. The benchmark loop is unaffected
+  (still ~12 ms for 10M iterations, tied with `g++ -O2`).
+- **Bounded string work.** Concatenation allocates exactly
+  `len(a) + len(b) + 1` with an overflow check on the size, and the
+  headless UI runtime reads stdin through a bounded buffer.
+
+`tests/security_test.rs` covers the overflow traps and verifies the
+binary is a PIE (`DYN`) with a `GNU_RELRO` segment.
+
 ## Project system notes
 
 `nexa.toml` and `nexa.lock` are preserved. Local path dependencies are resolved
