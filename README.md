@@ -13,19 +13,41 @@ path.
 
 ## Installation
 
-From a checkout, or straight from GitHub (requires cargo and `cc`):
+**Prebuilt binary (recommended, Linux x86-64):**
 
 ```sh
-./install.sh                        # from a NEXA source checkout
+./install.sh
+```
+
+Downloads the latest release from
+[GitHub Releases](https://github.com/NEXA-New-Language/nexa/releases),
+verifies its SHA-256 checksum, and installs `nexa` into `~/.cargo/bin`.
+If no prebuilt binary is available yet, it builds from source
+automatically. `./install.sh --from-source` always builds from source.
+
+**From source:**
+
+```sh
 cargo install --git https://github.com/NEXA-New-Language/nexa --locked nexa
 ```
 
-`install.sh` also accepts `--branch <name>` (or `NEXA_BRANCH=<name>`).
-It installs the `nexa` binary into `~/.cargo/bin`; add that to your
-`PATH` if it is not there already. Verify with `nexa --version`.
+Requires cargo and `cc`. Verify with `nexa --version`. The release
+profile (`opt-level = 3`, LTO, stripped) keeps the installed compiler
+around 1.2 MB.
 
-The release profile (`opt-level = 3`, LTO, stripped) keeps the
-installed compiler around 1.2 MB.
+## Releasing a new version
+
+Push a version tag and the release workflow builds and publishes the
+prebuilt binary:
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+`.github/workflows/release.yml` builds the release compiler, runs the
+full test suite, and uploads `nexa-<version>-x86_64-linux.tar.gz` (plus
+its `.sha256`) to the GitHub Release for that tag.
 
 ## Build the compiler
 
