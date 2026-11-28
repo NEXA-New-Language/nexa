@@ -12,6 +12,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 const COUNTER: &str = include_str!("../examples/ui_counter.nexa");
 const FORM: &str = include_str!("../examples/ui_form.nexa");
+const CALCULATOR: &str = include_str!("../examples/ui_calculator.nexa");
 
 fn accepts(source: &str) {
     let result = analyze_source("test.nexa", source);
@@ -499,4 +500,45 @@ fn headless_eof_exits_cleanly() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("Window Counter size=480x320"));
     assert!(stdout.contains("Button Increment"));
+}
+
+#[test]
+fn accepts_calculator_example() {
+    accepts(CALCULATOR);
+}
+
+#[test]
+fn calculator_computes_and_guards_division_by_zero() {
+    let out = run_headless(
+        "calculator",
+        CALCULATOR,
+        "click 7\nclick +\nclick 8\nclick =\nclick C\nclick 9\nclick *\nclick 6\nclick =\nclick 8\nclick /\nclick 2\nclick =\nclick 5\nclick /\nclick 0\nclick =\nquit\n",
+    );
+    assert!(
+        out.status.success(),
+        "calculator exited with {:?}, stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let snapshots: Vec<&str> = stdout.split("Window Calculator size=320x420").collect();
+    assert_eq!(snapshots.len(), 19, "expected 18 snapshots, got:\n{}", stdout);
+    assert!(snapshots[5].contains("Text 15"), "7 + 8:\n{}", stdout);
+    assert!(snapshots[10].contains("Text 54"), "9 * 6:\n{}", stdout);
+    assert!(snapshots[14].contains("Text 4"), "8 / 2:\n{}", stdout);
+    assert!(snapshots[18].contains("Text 0"), "5 / 0 guard:\n{}", stdout);
+}
+
+#[test]
+fn calculator_chains_operations() {
+    let out = run_headless(
+        "calculator_chain",
+        CALCULATOR,
+        "click 2\nclick +\nclick 3\nclick +\nclick 4\nclick =\nquit\n",
+    );
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let snapshots: Vec<&str> = stdout.split("Window Calculator size=320x420").collect();
+    assert_eq!(snapshots.len(), 8, "expected 7 snapshots, got:\n{}", stdout);
+    assert!(snapshots[7].contains("Text 9"), "2 + 3 + 4:\n{}", stdout);
 }
