@@ -55,8 +55,12 @@ print(b)
         !out.contains("imul rax, rbx"),
         "no multiply is emitted for constant arithmetic"
     );
+    // The __nexa_concat helper is always emitted (and __nexa_str_append
+    // calls it); only a call from the program's own code would mean the
+    // fold failed. Main comes after the runtime helpers.
+    let main_code = out.split("main:\n").nth(1).unwrap();
     assert!(
-        !out.contains("call __nexa_concat"),
+        !main_code.contains("call __nexa_concat"),
         "no concat call is emitted for constant strings"
     );
 }

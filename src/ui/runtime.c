@@ -28,6 +28,25 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+
+/* NEXA strings carry a 24-byte header (len, cap, shared) before the
+ * NUL-terminated data; a string value is a pointer to the data. Strings
+ * handed in from the UI are always shared: NEXA code must never append
+ * to them in place. */
+static char *nexa_dup_string(const char *s) {
+    size_t len = strlen(s);
+    char *block = malloc(24 + len + 1);
+    if (!block) {
+        fprintf(stderr, "out of memory\n");
+        exit(1);
+    }
+    *(int64_t *)block = (int64_t)len;
+    *(int64_t *)(block + 8) = (int64_t)len;
+    *(int64_t *)(block + 16) = 1;
+    memcpy(block + 24, s, len + 1);
+    return block + 24;
+}
 
 /* State storage emitted by the generated code. */
 extern long long __nexa_ui_state[];
@@ -193,7 +212,7 @@ static void on_entry_changed(void *entry, void *data) {
     const char *text = gtk_entry_get_text(entry);
     void (*handler)(const char *) = (void (*)(const char *))data;
     if (handler) {
-        handler(text ? strdup(text) : strdup(""));
+        handler(nexa_dup_string(text ? text : ""));
     }
     if (g_render) {
         g_render();
@@ -418,7 +437,7 @@ void nexa_ui_run(void) {
             }
             void (*handler)(const char *) = (void (*)(const char *))e->handler;
             if (handler) {
-                handler(strdup(value));
+                handler(nexa_dup_string(value));
             }
             if (g_render) {
                 g_render();

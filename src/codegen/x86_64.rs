@@ -89,18 +89,30 @@ impl X86_64CodeGen {
         rodata.push_str(".LC_bool_true:\n    .asciz \"true\"\n");
         rodata.push_str(".LC_bool_false:\n    .asciz \"false\"\n");
         rodata.push_str(".LC_sign_mask:\n    .quad 0x8000000000000000, 0\n");
-        for (label, content) in &self.string_literals {
-            rodata.push_str(&format!("{}:\n", label));
-            emit_bytes(&mut rodata, content.as_bytes());
-            rodata.push_str("    .byte 0\n");
-        }
         for (label, bits) in &self.float_literals {
             rodata.push_str(&format!("{}:\n    .quad {}\n", label, bits));
         }
+        // String literals live in writable .data: their headers are
+        // updated by __nexa_share, and .rodata is read-only.
+        let mut data = String::from(".section .data\n");
+        for (label, content) in &self.string_literals {
+            // Strings carry a 24-byte header (len, cap, shared) before the
+            // NUL-terminated data; the label still points at the data.
+            data.push_str("    .balign 8\n");
+            data.push_str(&format!(
+                "    .quad {}, {}, 1\n{}:\n",
+                content.len(),
+                content.len(),
+                label
+            ));
+            emit_bytes(&mut data, content.as_bytes());
+            data.push_str("    .byte 0\n");
+        }
 
         format!(
-            ".intel_syntax noprefix\n{}\n.text\n{}{}{}\n.section .note.GNU-stack,\"\",@progbits\n",
+            ".intel_syntax noprefix\n{}\n{}\n.text\n{}{}{}\n.section .note.GNU-stack,\"\",@progbits\n",
             rodata,
+            data,
             runtime_asm(),
             functions_code,
             main_code
@@ -165,13 +177,24 @@ impl X86_64CodeGen {
         rodata.push_str(".LC_bool_true:\n    .asciz \"true\"\n");
         rodata.push_str(".LC_bool_false:\n    .asciz \"false\"\n");
         rodata.push_str(".LC_sign_mask:\n    .quad 0x8000000000000000, 0\n");
-        for (label, content) in &self.string_literals {
-            rodata.push_str(&format!("{}:\n", label));
-            emit_bytes(&mut rodata, content.as_bytes());
-            rodata.push_str("    .byte 0\n");
-        }
         for (label, bits) in &self.float_literals {
             rodata.push_str(&format!("{}:\n    .quad {}\n", label, bits));
+        }
+        // String literals live in writable .data: their headers are
+        // updated by __nexa_share, and .rodata is read-only.
+        let mut data = String::from(".section .data\n");
+        for (label, content) in &self.string_literals {
+            // Strings carry a 24-byte header (len, cap, shared) before the
+            // NUL-terminated data; the label still points at the data.
+            data.push_str("    .balign 8\n");
+            data.push_str(&format!(
+                "    .quad {}, {}, 1\n{}:\n",
+                content.len(),
+                content.len(),
+                label
+            ));
+            emit_bytes(&mut data, content.as_bytes());
+            data.push_str("    .byte 0\n");
         }
 
         let state_bytes = analyzed.slot_types.len().max(1) * 8;
@@ -181,8 +204,8 @@ impl X86_64CodeGen {
         );
 
         format!(
-            ".intel_syntax noprefix\n{}\n.text\n{}{}{}{}\n{}\n.section .note.GNU-stack,\"\",@progbits\n",
-            rodata, runtime_asm(), functions_code, render_code, main_code, bss
+            ".intel_syntax noprefix\n{}\n{}\n.text\n{}{}{}{}\n{}\n.section .note.GNU-stack,\"\",@progbits\n",
+            rodata, data, runtime_asm(), functions_code, render_code, main_code, bss
         )
     }
 }
@@ -371,6 +394,16 @@ impl<'a> GenCtx<'a> {
         }
     }
 
+    /// After storing a string value, mark its buffer shared when the value
+    /// was copied from another variable: the buffer now has two owners, so
+    /// it must never be appended to in place. `rax` still holds the
+    /// pointer after `store_slot`.
+    fn mark_string_shared(&self, value: &Expr, ty: &Type, out: &mut String) {
+        if *ty == Type::String && matches!(value, Expr::Variable { .. }) {
+            out.push_str("    mov rdi, rax\n    call __nexa_share\n");
+        }
+    }
+
     /// Emit a compile-time constant value (used by constant folding).
     fn emit_const(&mut self, value: &ConstVal, out: &mut String) {
         match value {
@@ -401,13 +434,20 @@ impl<'a> GenCtx<'a> {
         }
     }
 
-    /// Peephole: `x = x +/- <expr>` on an integer variable updates the
-    /// variable in place instead of loading, computing and storing it.
+    /// Peephole: `x = x +/- <expr>` on an integer or float variable updates
+    /// the variable in place instead of loading, computing and storing it.
+    /// For strings, `s = s + e` appends in place when the buffer is
+    /// uniquely owned (see `__nexa_str_append`).
     /// Returns true when the assignment was emitted (or is a no-op).
     fn try_gen_self_assign(&mut self, slot: usize, value: &Expr, out: &mut String) -> bool {
-        if self.analyzed.slot_types.get(slot) != Some(&Type::Int) {
+        let slot_ty = self.analyzed.slot_types.get(slot);
+        if slot_ty != Some(&Type::Int)
+            && slot_ty != Some(&Type::Float)
+            && slot_ty != Some(&Type::String)
+        {
             return false;
         }
+        let is_float = slot_ty == Some(&Type::Float);
         let Expr::Binary { left, op, right, .. } = value else {
             return false;
         };
@@ -427,6 +467,22 @@ impl<'a> GenCtx<'a> {
             return false;
         };
         let loc = self.slot_location(slot);
+        if slot_ty == Some(&Type::String) {
+            // Only `s = s + e` appends in place; `s = e + s` is a fresh
+            // string. The helper appends in place when the buffer is
+            // uniquely owned and falls back to a fresh string otherwise.
+            if !is_add || !is_self(left, slot, self) {
+                return false;
+            }
+            self.gen_expr(other, 0, out);
+            out.push_str(&format!(
+                "    mov rsi, rax\n    lea rdi, {loc}\n    call __nexa_str_append\n"
+            ));
+            return true;
+        }
+        if is_float {
+            return self.try_gen_float_self_assign(&loc, is_add, other, out);
+        }
         match const_eval(other) {
             Some(ConstVal::Int(c)) => {
                 // `x = x + 0` is a no-op; anything else is one instruction.
@@ -448,6 +504,135 @@ impl<'a> GenCtx<'a> {
                 ));
                 true
             }
+        }
+    }
+
+    /// Float half of the self-assign peephole: `x = x +/- e` becomes a
+    /// load, one `addsd`/`subsd`, and a store. Unlike the integer case,
+    /// `x + 0.0` is never skipped: it flips the sign of `-0.0`.
+    fn try_gen_float_self_assign(
+        &mut self,
+        loc: &str,
+        is_add: bool,
+        other: &Expr,
+        out: &mut String,
+    ) -> bool {
+        let instr = if is_add { "addsd" } else { "subsd" };
+        match const_eval(other) {
+            Some(ConstVal::Float(c)) => {
+                let label = self.label("float");
+                self.floats.push((label.clone(), c.to_bits()));
+                out.push_str(&format!(
+                    "    movsd xmm0, {loc}\n    {instr} xmm0, [rip + {label}]\n    movsd {loc}, xmm0\n"
+                ));
+                true
+            }
+            _ => {
+                self.gen_expr(other, 0, out);
+                if is_add {
+                    out.push_str(&format!(
+                        "    {instr} xmm0, {loc}\n    movsd {loc}, xmm0\n"
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "    movsd xmm1, xmm0\n    movsd xmm0, {loc}\n    subsd xmm0, xmm1\n    movsd {loc}, xmm0\n"
+                    ));
+                }
+                true
+            }
+        }
+    }
+
+    /// Emit `rax = rax / c` or `rax = rax % c` for a constant divisor `c`
+    /// (c != 0) without `idiv`: powers of two become shifts, other
+    /// constants become a multiply by a magic number. Division by -1 traps
+    /// on `i64::MIN` and division by `i64::MIN` folds to a comparison,
+    /// exactly like the `__nexa_div` runtime helper. For modulo, the
+    /// quotient is computed first and `r = n - (n / c) * c` follows.
+    fn gen_const_divmod(&mut self, op: BinaryOp, c: i64, out: &mut String) {
+        if c == 1 {
+            if op == BinaryOp::Mod {
+                out.push_str("    xor eax, eax\n");
+            }
+            return;
+        }
+        if c == -1 {
+            if op == BinaryOp::Mod {
+                out.push_str("    xor eax, eax\n");
+                return;
+            }
+            let trap = self.label("div_overflow");
+            let done = self.label("div_done");
+            out.push_str("    mov rcx, 0x8000000000000000\n");
+            out.push_str("    cmp rax, rcx\n");
+            out.push_str(&format!("    je {trap}\n"));
+            out.push_str("    neg rax\n");
+            out.push_str(&format!("    jmp {done}\n"));
+            out.push_str(&format!("{trap}:\n"));
+            out.push_str(
+                "    sub rsp, 8\n    lea rdi, [rip + .Lerr_div_overflow]\n    mov rsi, 26\n    call __nexa_runtime_error\n",
+            );
+            out.push_str(&format!("{done}:\n"));
+            return;
+        }
+        if c == i64::MIN {
+            // n / MIN is 1 only for n == MIN, else 0; n % MIN is 0 only
+            // for n == MIN, else n.
+            if op == BinaryOp::Div {
+                out.push_str("    mov rcx, 0x8000000000000000\n");
+                out.push_str("    cmp rax, rcx\n");
+                out.push_str("    sete al\n    movzx rax, al\n");
+            } else {
+                out.push_str("    mov rcx, 0x8000000000000000\n");
+                out.push_str("    xor edx, edx\n");
+                out.push_str("    cmp rax, rcx\n");
+                out.push_str("    cmove rax, rdx\n");
+            }
+            return;
+        }
+        let is_mod = op == BinaryOp::Mod;
+        // For modulo, keep the dividend around: r = n - (n / c) * c.
+        if is_mod {
+            out.push_str("    push rax\n");
+        }
+        let ac = c.unsigned_abs();
+        if ac.is_power_of_two() {
+            let k = ac.trailing_zeros();
+            out.push_str("    mov rcx, rax\n");
+            out.push_str("    sar rcx, 63\n");
+            out.push_str(&format!("    mov rdx, 0x{:x}\n", ac - 1));
+            out.push_str("    and rcx, rdx\n");
+            out.push_str("    add rax, rcx\n");
+            out.push_str(&format!("    sar rax, {k}\n"));
+            if c < 0 {
+                out.push_str("    neg rax\n");
+            }
+        } else {
+            let (magic, shift) = unsigned_div_magic(ac);
+            out.push_str("    mov rcx, rax\n");
+            out.push_str("    mov rdx, rax\n");
+            out.push_str("    sar rdx, 63\n");
+            out.push_str("    xor rax, rdx\n");
+            out.push_str("    sub rax, rdx\n");
+            out.push_str(&format!("    mov rbx, 0x{magic:x}\n"));
+            out.push_str("    mul rbx\n");
+            out.push_str(&format!("    shr rdx, {shift}\n"));
+            let done = self.label("div_done");
+            out.push_str("    test rcx, rcx\n");
+            out.push_str(&format!("    jns {done}\n"));
+            out.push_str("    neg rdx\n");
+            out.push_str(&format!("{done}:\n"));
+            out.push_str("    mov rax, rdx\n");
+            if c < 0 {
+                out.push_str("    neg rax\n");
+            }
+        }
+        if is_mod {
+            out.push_str(&format!("    mov rdx, 0x{:x}\n", c as u64));
+            out.push_str("    imul rax, rdx\n");
+            out.push_str("    pop rcx\n");
+            out.push_str("    sub rcx, rax\n");
+            out.push_str("    mov rax, rcx\n");
         }
     }
 
@@ -978,12 +1163,14 @@ impl<'a> GenCtx<'a> {
                 let ty = self.gen_expr(value, depth, out);
                 let slot = self.binding(name.span);
                 self.store_slot(out, &ty, slot);
+                self.mark_string_shared(value, &ty, out);
             }
             Stmt::Assign { target, value, .. } => {
                 let slot = self.binding(target.span);
                 if !self.try_gen_self_assign(slot, value, out) {
                     let ty = self.gen_expr(value, depth, out);
                     self.store_slot(out, &ty, slot);
+                    self.mark_string_shared(value, &ty, out);
                 }
             }
             Stmt::UiApp { .. } => {
@@ -1186,6 +1373,23 @@ impl<'a> GenCtx<'a> {
                     return result_ty;
                 }
 
+                // Division/modulo by a constant divisor: strength-reduce
+                // to a multiply/shift sequence instead of `idiv`. The
+                // divisor expression is pure when it folds to a constant,
+                // so it is never evaluated. A zero divisor keeps the
+                // generic path, which traps at runtime.
+                if left_ty_static == Type::Int
+                    && matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                {
+                    if let Some(ConstVal::Int(c)) = const_eval(right) {
+                        if c != 0 {
+                            self.gen_expr(left, depth, out);
+                            self.gen_const_divmod(*op, c, out);
+                            return result_ty;
+                        }
+                    }
+                }
+
                 let left_ty = self.gen_expr(left, depth, out);
                 let temp = self.temp_offset(depth);
                 store_temp(out, &left_ty, temp);
@@ -1302,6 +1506,17 @@ impl<'a> GenCtx<'a> {
                     let ty = self.gen_expr(arg, depth + i, out);
                     let temp = self.temp_offset(depth + i);
                     store_temp(out, &ty, temp);
+                }
+                // A string argument aliases the caller's buffer: mark it
+                // shared so the callee cannot append to it in place.
+                for (i, ty) in sig.params.iter().enumerate() {
+                    if *ty == Type::String {
+                        let temp = self.temp_offset(depth + i);
+                        out.push_str(&format!(
+                            "    mov rax, [rbp - {}]\n    mov rdi, rax\n    call __nexa_share\n",
+                            temp
+                        ));
+                    }
                 }
                 let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
                 let float_regs = ["xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"];
@@ -1797,6 +2012,9 @@ __nexa_str_eq:
 
 .globl __nexa_concat
 __nexa_concat:
+    # rdi = a, rsi = b (data pointers; a 24-byte header holds len, cap,
+    # shared at -24, -16, -8). Returns a fresh string with spare capacity
+    # for future appends; inputs are never mutated, so aliasing is safe.
     push rbp
     mov rbp, rsp
     push rbx
@@ -1807,29 +2025,43 @@ __nexa_concat:
     sub rsp, 8
     mov r12, rdi
     mov r13, rsi
-    mov rdi, r12
-    call strlen
-    mov r14, rax
-    mov rdi, r13
-    call strlen
-    mov r15, rax
-    lea rdi, [r14 + r15 + 1]
-    jc .Lconcat_overflow
+    mov r14, [r12 - 24]
+    mov r15, [r13 - 24]
+    mov rax, r14
+    add rax, r15
+    jo .Lconcat_overflow
+    push rax
+    mov rcx, rax
+    add rcx, rcx
+    jo .Lconcat_overflow
+    cmp rcx, 16
+    jae .Lconcat_cap_ok
+    mov rcx, 16
+.Lconcat_cap_ok:
+    push rcx
+    mov rdi, rcx
+    add rdi, 25
+    jo .Lconcat_overflow
     call malloc
     test rax, rax
     jz .Lconcat_oom
     mov rbx, rax
-    mov rdi, rbx
+    pop rcx
+    pop rax
+    mov [rbx], rax
+    mov [rbx + 8], rcx
+    mov qword ptr [rbx + 16], 0
+    lea rdi, [rbx + 24]
     mov rsi, r12
     mov rdx, r14
     call memcpy
-    lea rdi, [rbx + r14]
+    lea rdi, [rbx + r14 + 24]
     mov rsi, r13
     mov rdx, r15
     call memcpy
     lea rax, [r14 + r15]
-    mov byte ptr [rbx + rax], 0
-    mov rax, rbx
+    mov byte ptr [rbx + rax + 24], 0
+    lea rax, [rbx + 24]
     add rsp, 8
     pop r15
     pop r14
@@ -1845,6 +2077,72 @@ __nexa_concat:
 .Lconcat_oom:
     lea rdi, [rip + .Lerr_oom]
     mov rsi, 14
+    call __nexa_runtime_error
+
+.globl __nexa_share
+__nexa_share:
+    # Marks the string at [rdi - 8] as shared (it may be aliased
+    # elsewhere, so it must never be appended to in place). Null-safe.
+    test rdi, rdi
+    jz .Lshare_done
+    mov qword ptr [rdi - 8], 1
+.Lshare_done:
+    ret
+
+.globl __nexa_str_append
+__nexa_str_append:
+    # rdi = address of the slot holding the string, rsi = string to
+    # append. Appends in place when the buffer is uniquely owned and has
+    # room; otherwise allocates a fresh string (via __nexa_concat) and
+    # stores it in the slot.
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 8
+    mov r12, rdi
+    mov r13, rsi
+    mov rbx, [r12]
+    mov r14, [rbx - 24]
+    mov rcx, [rbx - 16]
+    mov rdx, [rbx - 8]
+    mov r15, [r13 - 24]
+    test rdx, rdx
+    jnz .Lappend_fresh
+    mov rax, r14
+    add rax, r15
+    jo .Lappend_overflow
+    cmp rcx, rax
+    jb .Lappend_fresh
+    lea rdi, [rbx + r14]
+    mov rsi, r13
+    mov rdx, r15
+    call memcpy
+    mov rax, r14
+    add rax, r15
+    mov byte ptr [rbx + rax], 0
+    mov [rbx - 24], rax
+    jmp .Lappend_done
+.Lappend_fresh:
+    mov rdi, rbx
+    mov rsi, r13
+    call __nexa_concat
+    mov [r12], rax
+.Lappend_done:
+    add rsp, 8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+.Lappend_overflow:
+    lea rdi, [rip + .Lerr_str_size]
+    mov rsi, 30
     call __nexa_runtime_error
 
 __nexa_print_int:
@@ -2006,5 +2304,110 @@ fn flip_cmp_op(op: BinaryOp) -> BinaryOp {
         BinaryOp::Greater => BinaryOp::Less,
         BinaryOp::GreaterEq => BinaryOp::LessEq,
         other => other,
+    }
+}
+
+/// Magic number for unsigned division by a constant `d`: returns
+/// `(magic, shift)` such that for every `u64` `n`,
+/// `n / d == ((magic as u128 * n as u128) >> 64) as u64 >> shift`.
+/// Requires `d >= 2` and `d` not a power of two (powers of two use
+/// shifts). This is the Granlund-Montgomery "round up" magic: with
+/// `s = floor(log2 d)`, `magic = floor(2^(64+s) / d) + 1` fits in 64 bits
+/// (for non-powers of two the quotient is never an integer, so the `+ 1`
+/// is exactly the ceiling) and the formula is exact for all `n`.
+fn unsigned_div_magic(d: u64) -> (u64, u32) {
+    debug_assert!(d >= 2 && !d.is_power_of_two());
+    let s = 63 - d.leading_zeros();
+    let m = ((1u128 << (64 + s)) / d as u128 + 1) as u64;
+    (m, s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reference implementation of the signed constant-division sequence
+    /// emitted by `gen_const_divmod`, for tests: `n / d` with `d != 0`.
+    fn magic_div_i64(n: i64, d: i64) -> i64 {
+        assert_ne!(d, 0);
+        if d == 1 {
+            return n;
+        }
+        if d == -1 {
+            assert_ne!(n, i64::MIN);
+            return -n;
+        }
+        if d == i64::MIN {
+            return if n == i64::MIN { 1 } else { 0 };
+        }
+        let ad = d.unsigned_abs();
+        let q = if ad.is_power_of_two() {
+            let k = ad.trailing_zeros();
+            let bias = if n < 0 { (ad - 1) as i64 } else { 0 };
+            n.wrapping_add(bias) >> k
+        } else {
+            let (m, s) = unsigned_div_magic(ad);
+            let a = n.unsigned_abs();
+            let q_u = (((m as u128 * a as u128) >> 64) as u64) >> s;
+            if n < 0 {
+                -(q_u as i64)
+            } else {
+                q_u as i64
+            }
+        };
+        if d < 0 {
+            -q
+        } else {
+            q
+        }
+    }
+
+    #[test]
+    fn magic_division_matches_native_division() {
+        let divisors: Vec<i64> = (2..=100)
+            .chain([127, 255, 256, 1000, 12345, 1 << 20, 1 << 31, (1 << 62) - 1, i64::MAX])
+            .chain((2..=100).map(|d| -d))
+            .chain([-1, 1, i64::MIN])
+            .collect();
+        let mut dividends: Vec<i64> = vec![
+            i64::MIN,
+            i64::MIN + 1,
+            -1_000_000,
+            -999,
+            -100,
+            -7,
+            -1,
+            0,
+            1,
+            7,
+            100,
+            999,
+            1_000_000,
+            i64::MAX - 1,
+            i64::MAX,
+        ];
+        // A deterministic spread across the whole range.
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        for _ in 0..2000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            dividends.push(x as i64);
+        }
+        for &d in &divisors {
+            for &n in &dividends {
+                if d == -1 && n == i64::MIN {
+                    continue; // Overflows; the emitter traps instead.
+                }
+                assert_eq!(magic_div_i64(n, d), n / d, "n={}, d={}", n, d);
+                // Modulo follows from the quotient: n % d == n - (n / d) * d.
+                assert_eq!(
+                    n - magic_div_i64(n, d) * d,
+                    n % d,
+                    "n={}, d={}",
+                    n, d
+                );
+            }
+        }
     }
 }
