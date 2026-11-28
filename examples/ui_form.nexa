@@ -1,0 +1,48 @@
+app("Form") {
+    state name = "NEXA"
+    state checked = false
+    state score = 1.5
+
+    Window {
+        title("Form")
+        size(400, 300)
+
+        Column {
+            spacing(8)
+            padding(20)
+
+            Row {
+                spacing(4)
+
+                Text("Name:")
+                Text(name)
+            }
+
+            TextField(name) {
+                on_change(value) {
+                    name = value
+                }
+            }
+
+            Checkbox(checked) {
+                on_change(value) {
+                    checked = value
+                }
+            }
+
+            Text(checked)
+            Text(score)
+
+            Container {
+                background("#1E90FF")
+                align("center")
+
+                Text("Welcome")
+            }
+
+            Spacer
+            Divider
+            Image("logo.png")
+        }
+    }
+}

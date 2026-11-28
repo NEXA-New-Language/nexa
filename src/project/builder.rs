@@ -4,7 +4,6 @@ use crate::project::lockfile::{LockedPackage, Lockfile};
 use crate::project::manifest::Manifest;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,31 +81,15 @@ impl NativeBuilder {
             )
         })?;
 
-        let mut cc_args = vec!["-no-pie"];
-        match mode {
-            BuildMode::Debug => {
-                cc_args.push("-g");
-                cc_args.push("-O0");
-            }
-            BuildMode::Release => {
-                cc_args.push("-O3");
-                cc_args.push("-s");
-            }
-        }
-        let temp_asm_str = temp_asm_path.to_str().unwrap();
-        let binary_str = binary_path.to_str().unwrap();
-        cc_args.extend(["-o", binary_str, temp_asm_str, "-lm"]);
-
-        let status = Command::new("cc")
-            .args(&cc_args)
-            .status()
-            .map_err(|e| format!("Failed to invoke system linker 'cc': {}", e))?;
-
+        let extra_cc_args: &[&str] = match mode {
+            BuildMode::Debug => &["-g", "-O0"],
+            BuildMode::Release => &["-O3", "-s"],
+        };
+        let ui = crate::source_has_ui_app(&source);
+        let link_result =
+            crate::link_native_binary(&temp_asm_path, &binary_path, ui, extra_cc_args);
         let _ = fs::remove_file(&temp_asm_path);
-
-        if !status.success() {
-            return Err("Linker Error: Failed to generate native executable.".to_string());
-        }
+        link_result.map_err(|e| format!("Linker Error: {}", e))?;
 
         let checksum = Lockfile::compute_checksum(source.as_bytes());
 

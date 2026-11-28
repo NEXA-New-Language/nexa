@@ -1,6 +1,7 @@
 use crate::semantics::{AnalyzedProgram, SemanticAnalyzer};
 use crate::syntax::ast::*;
 use crate::types::Type;
+use std::collections::HashMap;
 
 /// Native x86-64 System V backend. Programs are lowered directly to GNU as
 /// Intel-syntax assembly and linked with the platform C runtime; there is no
@@ -36,6 +37,18 @@ impl X86_64CodeGen {
     }
 
     pub fn generate_analyzed(mut self, analyzed: &AnalyzedProgram) -> String {
+        if let Some(app) = analyzed
+            .program
+            .statements
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::UiApp { app, .. } => Some(app),
+                _ => None,
+            })
+        {
+            return self.generate_ui_analyzed(analyzed, app);
+        }
+
         let mut ctx = GenCtx {
             analyzed,
             labels: &mut self.label_id,
@@ -92,6 +105,158 @@ impl X86_64CodeGen {
             functions_code,
             main_code
         )
+    }
+    /// UI 1.0 backend (spec section 8): state lives in a global array
+    /// shared by `main`, the render function and every event handler;
+    /// `main` hands the render function to the native UI runtime
+    /// (`nexa_ui_init` / `nexa_ui_run`, see src/ui/runtime.c), which owns
+    /// the window, the event loop and re-rendering after each event.
+    fn generate_ui_analyzed(mut self, analyzed: &AnalyzedProgram, app: &UiApp) -> String {
+        let handlers = collect_ui_handlers(app);
+        let handler_indices: HashMap<Span, usize> = handlers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (h.span, i))
+            .collect();
+
+        let mut ctx = GenCtx {
+            analyzed,
+            labels: &mut self.label_id,
+            strings: &mut self.string_literals,
+            floats: &mut self.float_literals,
+            frame_size: 0,
+        };
+
+        let max_depth = max_expr_depth_program(&analyzed.program);
+        let max_stack_args = max_call_stack_args(&analyzed.program);
+        let outgoing = max_stack_args.saturating_sub(6);
+        let words = analyzed.slot_types.len() + max_depth + outgoing;
+        ctx.frame_size = (words * 8).div_ceil(16) * 16;
+
+        let mut functions_code = String::new();
+        for (i, handler) in handlers.iter().enumerate() {
+            ctx.gen_ui_handler(handler, i, &mut functions_code);
+        }
+        let mut render_code = String::new();
+        ctx.gen_ui_render(app, &handler_indices, &mut render_code);
+
+        let mut main_body = String::new();
+        for state in &app.states {
+            let ty = ctx.gen_expr(&state.value, 0, &mut main_body);
+            let slot = ctx.binding(state.name.span);
+            ctx.store_slot(&mut main_body, &ty, slot);
+        }
+        let app_name_label = ctx.intern_string(&app.name);
+        main_body.push_str("    lea rdi, [rip + __nexa_ui_render]\n");
+        main_body.push_str(&format!("    lea rsi, [rip + {}]\n", app_name_label));
+        main_body.push_str("    call nexa_ui_init\n");
+        main_body.push_str("    call nexa_ui_run\n");
+
+        let mut main_code = String::new();
+        main_code.push_str(".globl main\nmain:\n");
+        main_code.push_str("    push rbp\n    mov rbp, rsp\n");
+        main_code.push_str(&format!("    sub rsp, {}\n", ctx.frame_size));
+        main_code.push_str(&main_body);
+        main_code.push_str("    xor eax, eax\n    leave\n    ret\n");
+
+        let mut rodata = String::from(".section .rodata\n");
+        rodata.push_str(".LC_fmt_int:\n    .asciz \"%ld\\n\"\n");
+        rodata.push_str(".LC_fmt_float:\n    .asciz \"%.17g\\n\"\n");
+        rodata.push_str(".LC_bool_true:\n    .asciz \"true\"\n");
+        rodata.push_str(".LC_bool_false:\n    .asciz \"false\"\n");
+        rodata.push_str(".LC_sign_mask:\n    .quad 0x8000000000000000, 0\n");
+        for (label, content) in &self.string_literals {
+            rodata.push_str(&format!("{}:\n", label));
+            emit_bytes(&mut rodata, content.as_bytes());
+            rodata.push_str("    .byte 0\n");
+        }
+        for (label, bits) in &self.float_literals {
+            rodata.push_str(&format!("{}:\n    .quad {}\n", label, bits));
+        }
+
+        let state_bytes = analyzed.slot_types.len().max(1) * 8;
+        let bss = format!(
+            ".section .bss\n    .balign 8\n    .globl __nexa_ui_state\n__nexa_ui_state:\n    .zero {}\n",
+            state_bytes
+        );
+
+        format!(
+            ".intel_syntax noprefix\n{}\n.text\n{}{}{}{}\n{}\n.section .note.GNU-stack,\"\",@progbits\n",
+            rodata, runtime_asm(), functions_code, render_code, main_code, bss
+        )
+    }
+}
+
+/// One compiled event handler: an `on_click` body (no parameter) or an
+/// `on_change(value)` body (one String/Bool parameter).
+struct UiHandlerInfo<'a> {
+    body: &'a Block,
+    param: Option<(Ident, Type)>,
+    span: Span,
+}
+
+fn collect_ui_handlers<'a>(app: &'a UiApp) -> Vec<UiHandlerInfo<'a>> {
+    let mut out = Vec::new();
+    if let Some(window) = &app.window {
+        for item in &window.items {
+            collect_ui_item_handlers(item, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_ui_item_handlers<'a>(item: &'a UiItem, out: &mut Vec<UiHandlerInfo<'a>>) {
+    match item {
+        UiItem::Component(comp) => collect_ui_component_handlers(comp, out),
+        UiItem::EventHandler(handler) => out.push(UiHandlerInfo {
+            body: &handler.body,
+            param: None,
+            span: handler.span,
+        }),
+        UiItem::ChangeHandler(handler) => out.push(UiHandlerInfo {
+            body: &handler.body,
+            param: Some((handler.param.clone(), Type::String)),
+            span: handler.span,
+        }),
+        UiItem::Property(_) => {}
+    }
+}
+
+fn collect_ui_component_handlers<'a>(comp: &'a UiComponent, out: &mut Vec<UiHandlerInfo<'a>>) {
+    match comp {
+        UiComponent::Layout { items, .. } => {
+            for item in items {
+                collect_ui_item_handlers(item, out);
+            }
+        }
+        UiComponent::Button { handler, .. } => {
+            if let Some(h) = handler {
+                out.push(UiHandlerInfo {
+                    body: &h.body,
+                    param: None,
+                    span: h.span,
+                });
+            }
+        }
+        UiComponent::TextField { handler, .. } => {
+            if let Some(h) = handler {
+                out.push(UiHandlerInfo {
+                    body: &h.body,
+                    param: Some((h.param.clone(), Type::String)),
+                    span: h.span,
+                });
+            }
+        }
+        UiComponent::Checkbox { handler, .. } => {
+            if let Some(h) = handler {
+                out.push(UiHandlerInfo {
+                    body: &h.body,
+                    param: Some((h.param.clone(), Type::Bool)),
+                    span: h.span,
+                });
+            }
+        }
+        _ => {}
     }
 }
 
@@ -178,19 +343,423 @@ impl<'a> GenCtx<'a> {
         out.push_str("    xor eax, eax\n    leave\n    ret\n");
     }
 
+    // --------------------------------------------------------------
+    // NEXA UI 1.0 code generation (spec section 8).
+    // --------------------------------------------------------------
+
+    fn is_state_slot(&self, slot: usize) -> bool {
+        self.analyzed.state_slots.contains(&slot)
+    }
+
+    /// Store rax/xmm0 into a binding: `state` variables live in the global
+    /// `__nexa_ui_state` array, ordinary locals live in the stack frame.
+    fn store_slot(&self, out: &mut String, ty: &Type, slot: usize) {
+        if self.is_state_slot(slot) {
+            if *ty == Type::Float {
+                out.push_str(&format!(
+                    "    movsd [rip + __nexa_ui_state + {}], xmm0\n",
+                    slot * 8
+                ));
+            } else {
+                out.push_str(&format!(
+                    "    mov [rip + __nexa_ui_state + {}], rax\n",
+                    slot * 8
+                ));
+            }
+        } else {
+            store_rax(out, ty, self.offset(slot));
+        }
+    }
+
+    fn intern_string(&mut self, value: &str) -> String {
+        let label = self.label("str");
+        self.strings.push((label.clone(), value.to_string()));
+        label
+    }
+
+    fn print_static(&mut self, value: &str, out: &mut String) {
+        let label = self.intern_string(value);
+        out.push_str(&format!(
+            "    lea rax, [rip + {}]\n    mov rdi, rax\n    call nexa_ui_print_str\n",
+            label
+        ));
+    }
+
+    /// Evaluate an expression and print its value with the runtime helper
+    /// matching its type (a no-op in the windowed backend, which prints
+    /// nothing to stdout).
+    fn print_expr_value(&mut self, expr: &Expr, out: &mut String) {
+        let ty = self.gen_expr(expr, 0, out);
+        match ty {
+            Type::Float => out.push_str("    call nexa_ui_print_float\n"),
+            Type::String => {
+                out.push_str("    mov rdi, rax\n    call nexa_ui_print_str\n")
+            }
+            Type::Bool => {
+                out.push_str("    mov rdi, rax\n    call nexa_ui_print_bool\n")
+            }
+            _ => out.push_str("    mov rdi, rax\n    call nexa_ui_print_int\n"),
+        }
+    }
+
+    fn print_indent(&mut self, depth: usize, out: &mut String) {
+        out.push_str(&format!(
+            "    mov edi, {}\n    call nexa_ui_indent\n",
+            depth
+        ));
+    }
+
+    /// Evaluate an expression into the stack temp at `depth`.
+    fn eval_to_temp(&mut self, expr: &Expr, depth: usize, out: &mut String) -> Type {
+        let ty = self.gen_expr(expr, depth, out);
+        let temp = self.temp_offset(depth);
+        store_temp(out, &ty, temp);
+        ty
+    }
+
+    /// Emit a handler function pointer into `reg`, or zero when there is
+    /// no handler.
+    fn emit_handler_ptr(
+        &self,
+        handler_indices: &HashMap<Span, usize>,
+        span: Option<Span>,
+        reg: &str,
+        out: &mut String,
+    ) {
+        match span.and_then(|span| handler_indices.get(&span)) {
+            Some(index) => out.push_str(&format!(
+                "    lea {}, [rip + __nexa_ui_handler_{}]\n",
+                reg, index
+            )),
+            None => out.push_str(&format!("    xor {}, {}\n", reg, reg)),
+        }
+    }
+
+    fn gen_ui_handler(&mut self, info: &UiHandlerInfo, index: usize, out: &mut String) {
+        out.push_str(&format!("__nexa_ui_handler_{}:\n", index));
+        out.push_str("    push rbp\n    mov rbp, rsp\n");
+        out.push_str(&format!("    sub rsp, {}\n", self.frame_size));
+        if let Some((param, _)) = &info.param {
+            // The runtime passes the event value in rdi (string pointer or
+            // 0/1 for a checkbox).
+            let slot = self.binding(param.span);
+            let off = self.offset(slot);
+            out.push_str(&format!("    mov [rbp - {}], rdi\n", off));
+        }
+        for stmt in &info.body.statements {
+            self.gen_stmt(stmt, 0, out);
+        }
+        out.push_str("    xor eax, eax\n    leave\n    ret\n");
+    }
+
+    /// The render function: prints the snapshot (headless backend) and
+    /// creates/updates the native widgets (windowed backend) in one pass.
+    fn gen_ui_render(
+        &mut self,
+        app: &UiApp,
+        handler_indices: &HashMap<Span, usize>,
+        out: &mut String,
+    ) {
+        out.push_str("__nexa_ui_render:\n");
+        out.push_str("    push rbp\n    mov rbp, rsp\n");
+        out.push_str(&format!("    sub rsp, {}\n", self.frame_size));
+        out.push_str("    call nexa_ui_begin_render\n");
+        if let Some(window) = &app.window {
+            self.gen_ui_window(app, window, handler_indices, out);
+        }
+        out.push_str("    xor eax, eax\n    leave\n    ret\n");
+    }
+
+    fn gen_ui_window(
+        &mut self,
+        app: &UiApp,
+        window: &UiWindow,
+        handler_indices: &HashMap<Span, usize>,
+        out: &mut String,
+    ) {
+        let title_prop = window.items.iter().find_map(|item| match item {
+            UiItem::Property(prop) if prop.name.name == "title" => Some(prop),
+            _ => None,
+        });
+        let size_prop = window.items.iter().find_map(|item| match item {
+            UiItem::Property(prop) if prop.name.name == "size" => Some(prop),
+            _ => None,
+        });
+
+        self.print_indent(0, out);
+        self.print_static("Window ", out);
+        match title_prop {
+            Some(prop) => self.print_expr_value(&prop.args[0], out),
+            None => self.print_static(&app.name, out),
+        }
+        self.print_static(" size=", out);
+        match size_prop {
+            Some(prop) => {
+                self.print_expr_value(&prop.args[0], out);
+                self.print_static("x", out);
+                self.print_expr_value(&prop.args[1], out);
+            }
+            None => {
+                out.push_str("    mov rdi, 800\n    call nexa_ui_print_int\n");
+                self.print_static("x", out);
+                out.push_str("    mov rdi, 600\n    call nexa_ui_print_int\n");
+            }
+        }
+        for item in &window.items {
+            if let UiItem::Property(prop) = item {
+                if prop.name.name == "title" || prop.name.name == "size" {
+                    continue;
+                }
+                self.print_static(" ", out);
+                self.print_static(&prop.name.name, out);
+                self.print_static("=", out);
+                self.print_expr_value(&prop.args[0], out);
+            }
+        }
+        out.push_str("    call nexa_ui_print_nl\n");
+
+        match title_prop {
+            Some(prop) => {
+                self.eval_to_temp(&prop.args[0], 0, out);
+            }
+            None => {
+                let label = self.intern_string(&app.name);
+                let temp = self.temp_offset(0);
+                out.push_str(&format!("    lea rax, [rip + {}]\n", label));
+                out.push_str(&format!("    mov [rbp - {}], rax\n", temp));
+            }
+        }
+        match size_prop {
+            Some(prop) => {
+                self.eval_to_temp(&prop.args[0], 1, out);
+                self.eval_to_temp(&prop.args[1], 2, out);
+            }
+            None => {
+                for (depth, value) in [(1usize, 800i64), (2, 600)] {
+                    let temp = self.temp_offset(depth);
+                    out.push_str(&format!(
+                        "    mov rax, {}\n    mov [rbp - {}], rax\n",
+                        value, temp
+                    ));
+                }
+            }
+        }
+        out.push_str(&format!(
+            "    mov rdi, [rbp - {}]\n",
+            self.temp_offset(0)
+        ));
+        out.push_str(&format!(
+            "    mov rsi, [rbp - {}]\n",
+            self.temp_offset(1)
+        ));
+        out.push_str(&format!(
+            "    mov rdx, [rbp - {}]\n",
+            self.temp_offset(2)
+        ));
+        out.push_str("    call nexa_ui_window\n");
+
+        for item in &window.items {
+            if let UiItem::Property(prop) = item {
+                if prop.name.name == "title" || prop.name.name == "size" {
+                    continue;
+                }
+                self.gen_ui_prop_call(prop, out);
+            }
+        }
+        for item in &window.items {
+            if let UiItem::Component(comp) = item {
+                self.gen_ui_component(comp, 1, handler_indices, out);
+            }
+        }
+    }
+
+    fn gen_ui_prop_call(&mut self, prop: &UiProperty, out: &mut String) {
+        if prop.args.is_empty() {
+            return;
+        }
+        let name_label = self.intern_string(&prop.name.name);
+        let ty = self.eval_to_temp(&prop.args[0], 0, out);
+        out.push_str(&format!("    lea rdi, [rip + {}]\n", name_label));
+        let temp = self.temp_offset(0);
+        match ty {
+            Type::Float => {
+                out.push_str(&format!("    movsd xmm0, [rbp - {}]\n", temp));
+                out.push_str("    call nexa_ui_prop_float\n");
+            }
+            Type::String => {
+                out.push_str(&format!("    mov rsi, [rbp - {}]\n", temp));
+                out.push_str("    call nexa_ui_prop_str\n");
+            }
+            Type::Bool => {
+                out.push_str(&format!("    mov rsi, [rbp - {}]\n", temp));
+                out.push_str("    call nexa_ui_prop_bool\n");
+            }
+            _ => {
+                out.push_str(&format!("    mov rsi, [rbp - {}]\n", temp));
+                out.push_str("    call nexa_ui_prop_int\n");
+            }
+        }
+    }
+
+    fn gen_ui_component(
+        &mut self,
+        comp: &UiComponent,
+        depth: usize,
+        handler_indices: &HashMap<Span, usize>,
+        out: &mut String,
+    ) {
+        match comp {
+            UiComponent::Layout { kind, items, .. } => {
+                let (kind_name, kind_id) = match kind {
+                    LayoutKind::Column => ("Column", 0),
+                    LayoutKind::Row => ("Row", 1),
+                    LayoutKind::Container => ("Container", 2),
+                };
+                self.print_indent(depth, out);
+                self.print_static(kind_name, out);
+                for item in items {
+                    if let UiItem::Property(prop) = item {
+                        self.print_static(" ", out);
+                        self.print_static(&prop.name.name, out);
+                        self.print_static("=", out);
+                        self.print_expr_value(&prop.args[0], out);
+                    }
+                }
+                out.push_str("    call nexa_ui_print_nl\n");
+                out.push_str(&format!(
+                    "    mov edi, {}\n    call nexa_ui_begin_layout\n",
+                    kind_id
+                ));
+                for item in items {
+                    if let UiItem::Property(prop) = item {
+                        self.gen_ui_prop_call(prop, out);
+                    }
+                }
+                for item in items {
+                    if let UiItem::Component(child) = item {
+                        self.gen_ui_component(child, depth + 1, handler_indices, out);
+                    }
+                }
+                out.push_str("    call nexa_ui_end_layout\n");
+            }
+            UiComponent::Text { value, .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Text ", out);
+                self.print_expr_value(value, out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                match self.expr_type(value) {
+                    Type::Float => {
+                        self.gen_expr(value, 0, out);
+                        out.push_str("    call nexa_ui_text_float\n");
+                    }
+                    Type::String => {
+                        self.gen_expr(value, 0, out);
+                        out.push_str("    mov rdi, rax\n    call nexa_ui_text_str\n");
+                    }
+                    Type::Bool => {
+                        self.gen_expr(value, 0, out);
+                        out.push_str("    mov rdi, rax\n    call nexa_ui_text_bool\n");
+                    }
+                    _ => {
+                        self.gen_expr(value, 0, out);
+                        out.push_str("    mov rdi, rax\n    call nexa_ui_text_int\n");
+                    }
+                }
+            }
+            UiComponent::Button { label, handler, .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Button ", out);
+                self.print_expr_value(label, out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                self.gen_expr(label, 0, out);
+                out.push_str("    mov rdi, rax\n");
+                let span = handler.as_ref().map(|h| h.span);
+                self.emit_handler_ptr(handler_indices, span, "rsi", out);
+                out.push_str("    call nexa_ui_button\n");
+            }
+            UiComponent::TextField { bound, handler, .. } => {
+                self.print_indent(depth, out);
+                self.print_static("TextField ", out);
+                self.print_expr_value(bound, out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                let key = match bound {
+                    Expr::Variable { name } => name.name.clone(),
+                    _ => String::new(),
+                };
+                let key_label = self.intern_string(&key);
+                self.eval_to_temp(bound, 0, out);
+                out.push_str(&format!("    lea rdi, [rip + {}]\n", key_label));
+                out.push_str(&format!(
+                    "    mov rsi, [rbp - {}]\n",
+                    self.temp_offset(0)
+                ));
+                let span = handler.as_ref().map(|h| h.span);
+                self.emit_handler_ptr(handler_indices, span, "rdx", out);
+                out.push_str("    call nexa_ui_textfield\n");
+            }
+            UiComponent::Checkbox { bound, handler, .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Checkbox ", out);
+                self.print_expr_value(bound, out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                let (key, slot) = match bound {
+                    Expr::Variable { name } => {
+                        (name.name.clone(), self.binding(name.span))
+                    }
+                    _ => (String::new(), 0),
+                };
+                let key_label = self.intern_string(&key);
+                self.eval_to_temp(bound, 0, out);
+                out.push_str(&format!("    lea rdi, [rip + {}]\n", key_label));
+                out.push_str(&format!(
+                    "    mov rsi, [rbp - {}]\n",
+                    self.temp_offset(0)
+                ));
+                let span = handler.as_ref().map(|h| h.span);
+                self.emit_handler_ptr(handler_indices, span, "rdx", out);
+                out.push_str(&format!("    mov rcx, {}\n", slot));
+                out.push_str("    call nexa_ui_checkbox\n");
+            }
+            UiComponent::Spacer { .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Spacer", out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                out.push_str("    call nexa_ui_spacer\n");
+            }
+            UiComponent::Divider { .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Divider", out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                out.push_str("    call nexa_ui_divider\n");
+            }
+            UiComponent::Image { source, .. } => {
+                self.print_indent(depth, out);
+                self.print_static("Image ", out);
+                self.print_expr_value(source, out);
+                out.push_str("    call nexa_ui_print_nl\n");
+                self.gen_expr(source, 0, out);
+                out.push_str("    mov rdi, rax\n    call nexa_ui_image\n");
+            }
+        }
+    }
+
     fn gen_stmt(&mut self, stmt: &Stmt, depth: usize, out: &mut String) {
         match stmt {
             Stmt::Let { name, value, .. }
             | Stmt::Var { name, value, .. }
             | Stmt::Const { name, value, .. } => {
                 let ty = self.gen_expr(value, depth, out);
-                let off = self.offset(self.binding(name.span));
-                store_rax(out, &ty, off);
+                let slot = self.binding(name.span);
+                self.store_slot(out, &ty, slot);
             }
             Stmt::Assign { target, value, .. } => {
                 let ty = self.gen_expr(value, depth, out);
-                let off = self.offset(self.binding(target.span));
-                store_rax(out, &ty, off);
+                let slot = self.binding(target.span);
+                self.store_slot(out, &ty, slot);
+            }
+            Stmt::UiApp { .. } => {
+                // A UI application is compiled by generate_ui_analyzed, not
+                // as a statement inside a function body.
             }
             Stmt::If {
                 condition,
@@ -279,8 +848,23 @@ impl<'a> GenCtx<'a> {
                 }
             },
             Expr::Variable { name } => {
-                let off = self.offset(self.binding(name.span));
-                load_rax(out, &result_ty, off);
+                let slot = self.binding(name.span);
+                if self.is_state_slot(slot) {
+                    if result_ty == Type::Float {
+                        out.push_str(&format!(
+                            "    movsd xmm0, [rip + __nexa_ui_state + {}]\n",
+                            slot * 8
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "    mov rax, [rip + __nexa_ui_state + {}]\n",
+                            slot * 8
+                        ));
+                    }
+                } else {
+                    let off = self.offset(slot);
+                    load_rax(out, &result_ty, off);
+                }
             }
             Expr::Unary { op, expr, .. } => {
                 let ty = self.gen_expr(expr, depth, out);
@@ -571,6 +1155,95 @@ fn max_stmt_depth(stmt: &Stmt) -> usize {
             }
             m
         }
+        Stmt::UiApp { app, .. } => max_ui_app_depth(app),
+    }
+}
+
+fn max_ui_app_depth(app: &UiApp) -> usize {
+    let mut m = 0;
+    for state in &app.states {
+        m = m.max(max_expr_depth(&state.value));
+    }
+    if let Some(window) = &app.window {
+        for item in &window.items {
+            m = m.max(max_ui_item_depth(item));
+        }
+    }
+    m
+}
+
+fn max_ui_item_depth(item: &UiItem) -> usize {
+    match item {
+        UiItem::Property(prop) => prop
+            .args
+            .iter()
+            .map(max_expr_depth)
+            .max()
+            .unwrap_or(0),
+        UiItem::Component(comp) => max_ui_component_depth(comp),
+        UiItem::EventHandler(handler) => handler
+            .body
+            .statements
+            .iter()
+            .map(max_stmt_depth)
+            .max()
+            .unwrap_or(0),
+        UiItem::ChangeHandler(handler) => handler
+            .body
+            .statements
+            .iter()
+            .map(max_stmt_depth)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn max_ui_component_depth(comp: &UiComponent) -> usize {
+    match comp {
+        UiComponent::Layout { items, .. } => items
+            .iter()
+            .map(max_ui_item_depth)
+            .max()
+            .unwrap_or(0),
+        UiComponent::Text { value, .. } | UiComponent::Image { source: value, .. } => {
+            max_expr_depth(value)
+        }
+        UiComponent::Button {
+            label, handler, ..
+        } => {
+            let mut m = max_expr_depth(label);
+            if let Some(h) = handler {
+                m = m.max(
+                    h.body
+                        .statements
+                        .iter()
+                        .map(max_stmt_depth)
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            m
+        }
+        UiComponent::TextField {
+            bound, handler, ..
+        }
+        | UiComponent::Checkbox {
+            bound, handler, ..
+        } => {
+            let mut m = max_expr_depth(bound);
+            if let Some(h) = handler {
+                m = m.max(
+                    h.body
+                        .statements
+                        .iter()
+                        .map(max_stmt_depth)
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            m
+        }
+        UiComponent::Spacer { .. } | UiComponent::Divider { .. } => 0,
     }
 }
 
@@ -644,6 +1317,95 @@ fn max_call_stmt(stmt: &Stmt) -> usize {
             }
             m
         }
+        Stmt::UiApp { app, .. } => max_call_ui_app(app),
+    }
+}
+
+fn max_call_ui_app(app: &UiApp) -> usize {
+    let mut m = 0;
+    for state in &app.states {
+        m = m.max(max_call_expr(&state.value));
+    }
+    if let Some(window) = &app.window {
+        for item in &window.items {
+            m = m.max(max_call_ui_item(item));
+        }
+    }
+    m
+}
+
+fn max_call_ui_item(item: &UiItem) -> usize {
+    match item {
+        UiItem::Property(prop) => prop
+            .args
+            .iter()
+            .map(max_call_expr)
+            .max()
+            .unwrap_or(0),
+        UiItem::Component(comp) => max_call_ui_component(comp),
+        UiItem::EventHandler(handler) => handler
+            .body
+            .statements
+            .iter()
+            .map(max_call_stmt)
+            .max()
+            .unwrap_or(0),
+        UiItem::ChangeHandler(handler) => handler
+            .body
+            .statements
+            .iter()
+            .map(max_call_stmt)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn max_call_ui_component(comp: &UiComponent) -> usize {
+    match comp {
+        UiComponent::Layout { items, .. } => items
+            .iter()
+            .map(max_call_ui_item)
+            .max()
+            .unwrap_or(0),
+        UiComponent::Text { value, .. } | UiComponent::Image { source: value, .. } => {
+            max_call_expr(value)
+        }
+        UiComponent::Button {
+            label, handler, ..
+        } => {
+            let mut m = max_call_expr(label);
+            if let Some(h) = handler {
+                m = m.max(
+                    h.body
+                        .statements
+                        .iter()
+                        .map(max_call_stmt)
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            m
+        }
+        UiComponent::TextField {
+            bound, handler, ..
+        }
+        | UiComponent::Checkbox {
+            bound, handler, ..
+        } => {
+            let mut m = max_call_expr(bound);
+            if let Some(h) = handler {
+                m = m.max(
+                    h.body
+                        .statements
+                        .iter()
+                        .map(max_call_stmt)
+                        .max()
+                        .unwrap_or(0),
+                );
+            }
+            m
+        }
+        UiComponent::Spacer { .. } | UiComponent::Divider { .. } => 0,
     }
 }
 
