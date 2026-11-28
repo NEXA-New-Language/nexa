@@ -28,7 +28,11 @@ impl<'a> Parser<'a> {
             let stmt = self.parse_statement()?;
             let is_block_stmt = matches!(
                 stmt,
-                Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::Action { .. }
+                Stmt::If { .. }
+                    | Stmt::While { .. }
+                    | Stmt::Repeat { .. }
+                    | Stmt::Action { .. }
+                    | Stmt::UiApp { .. }
             );
             statements.push(stmt);
 
@@ -63,6 +67,7 @@ impl<'a> Parser<'a> {
 
     fn parse_statement(&mut self) -> Result<Stmt, Diagnostic> {
         match self.peek_kind() {
+            TokenKind::App => self.parse_ui_app(),
             TokenKind::Let => self.parse_var_decl(DeclKind::Let),
             TokenKind::Var => self.parse_var_decl(DeclKind::Var),
             TokenKind::Const => self.parse_var_decl(DeclKind::Const),
@@ -207,7 +212,11 @@ impl<'a> Parser<'a> {
             let stmt = self.parse_statement()?;
             let is_block_stmt = matches!(
                 stmt,
-                Stmt::If { .. } | Stmt::While { .. } | Stmt::Repeat { .. } | Stmt::Action { .. }
+                Stmt::If { .. }
+                    | Stmt::While { .. }
+                    | Stmt::Repeat { .. }
+                    | Stmt::Action { .. }
+                    | Stmt::UiApp { .. }
             );
             statements.push(stmt);
 
@@ -233,6 +242,366 @@ impl<'a> Parser<'a> {
         let span = lbrace.span.to(rbrace.span);
 
         Ok(Block { statements, span })
+    }
+
+    // ------------------------------------------------------------------
+    // NEXA UI 1.0 parsing (spec section 7 EBNF).
+    // ------------------------------------------------------------------
+
+    fn parse_ui_app(&mut self) -> Result<Stmt, Diagnostic> {
+        let start_span = self.advance().span; // `app`
+        self.expect(&TokenKind::LParen, "Expected '(' after 'app'.")?;
+        let (name, name_span) = self.expect_string("application name")?;
+        self.expect(&TokenKind::RParen, "Expected ')' after application name.")?;
+        self.skip_newlines();
+        let lbrace = self.expect(&TokenKind::LBrace, "Expected '{' after app(...).")?;
+        let _ = lbrace;
+        self.skip_newlines();
+
+        let mut states = Vec::new();
+        let mut window: Option<UiWindow> = None;
+
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            match self.peek_kind() {
+                TokenKind::State => {
+                    states.push(self.parse_ui_state()?);
+                }
+                TokenKind::Ident(name) if name == "Window" => {
+                    if window.is_some() {
+                        return Err(Diagnostic::error(
+                            "Syntax Error",
+                            self.file_name,
+                            self.current_span(),
+                            "UI 1.0 allows only one Window per application.",
+                            Some("Remove the extra Window block.".into()),
+                        ));
+                    }
+                    window = Some(self.parse_ui_window()?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        "Syntax Error",
+                        self.file_name,
+                        self.current_span(),
+                        "Expected 'state' or 'Window' inside app(...).",
+                        Some("A UI application contains state declarations and one Window."
+                            .into()),
+                    ));
+                }
+            }
+            self.skip_newlines();
+        }
+
+        let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' to end app(...).")?;
+        let span = start_span.to(rbrace.span);
+        Ok(Stmt::UiApp {
+            app: UiApp {
+                name,
+                name_span,
+                states,
+                window,
+                span,
+            },
+            span,
+        })
+    }
+
+    fn parse_ui_state(&mut self) -> Result<UiState, Diagnostic> {
+        let start_span = self.advance().span; // `state`
+        let name = self.expect_identifier("state name")?;
+        self.expect(&TokenKind::Assign, "Expected '=' after state name.")?;
+        let value = self.parse_expression(0)?;
+        let span = start_span.to(value.span());
+        Ok(UiState { name, value, span })
+    }
+
+    fn parse_ui_window(&mut self) -> Result<UiWindow, Diagnostic> {
+        let start_span = self.advance().span; // `Window`
+        self.skip_newlines();
+        self.expect(&TokenKind::LBrace, "Expected '{' after 'Window'.")?;
+        let items = self.parse_ui_items()?;
+        let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' to end Window.")?;
+        Ok(UiWindow {
+            items,
+            span: start_span.to(rbrace.span),
+        })
+    }
+
+    /// Items of a Window or layout block: properties, components and (in
+    /// layouts) event handlers. Newlines separate items.
+    fn parse_ui_items(&mut self) -> Result<Vec<UiItem>, Diagnostic> {
+        let mut items = Vec::new();
+        loop {
+            self.skip_newlines();
+            if self.check(&TokenKind::RBrace) || self.is_at_end() {
+                break;
+            }
+            items.push(self.parse_ui_item()?);
+        }
+        Ok(items)
+    }
+
+    fn parse_ui_item(&mut self) -> Result<UiItem, Diagnostic> {
+        match self.peek_kind() {
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                if is_ui_property_name(&name) {
+                    Ok(UiItem::Property(self.parse_ui_property()?))
+                } else if is_ui_component_name(&name) {
+                    Ok(UiItem::Component(self.parse_ui_component()?))
+                } else if name == "on_click" {
+                    self.advance();
+                    let body = self.parse_block()?;
+                    let span = body.span;
+                    Ok(UiItem::EventHandler(UiEventHandler { body, span }))
+                } else if name == "on_change" {
+                    self.advance();
+                    self.expect(&TokenKind::LParen, "Expected '(' after 'on_change'.")?;
+                    let param = self.expect_identifier("event parameter name")?;
+                    self.expect(&TokenKind::RParen, "Expected ')' after on_change parameter.")?;
+                    let body = self.parse_block()?;
+                    let span = param.span.to(body.span);
+                    Ok(UiItem::ChangeHandler(UiChangeHandler {
+                        param,
+                        body,
+                        span,
+                    }))
+                } else {
+                    Err(Diagnostic::error(
+                        "Syntax Error",
+                        self.file_name,
+                        self.current_span(),
+                        format!("Unknown component or property '{}'.", name),
+                        Some(
+                            "Valid components: Window, Column, Row, Container, Text, Button, TextField, Checkbox, Spacer, Divider, Image."
+                                .into(),
+                        ),
+                    ))
+                }
+            }
+            _ => Err(Diagnostic::error(
+                "Syntax Error",
+                self.file_name,
+                self.current_span(),
+                "Expected a property, component, or event handler here.",
+                None,
+            )),
+        }
+    }
+
+    fn parse_ui_property(&mut self) -> Result<UiProperty, Diagnostic> {
+        let name = self.expect_identifier("property name")?;
+        let start_span = name.span;
+        self.expect(&TokenKind::LParen, "Expected '(' after property name.")?;
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expression(0)?);
+                if self.match_token(&TokenKind::Comma) {
+                    continue;
+                }
+                break;
+            }
+        }
+        let rparen = self.expect(&TokenKind::RParen, "Expected ')' after property arguments.")?;
+        Ok(UiProperty {
+            name,
+            args,
+            span: start_span.to(rparen.span),
+        })
+    }
+
+    fn parse_ui_component(&mut self) -> Result<UiComponent, Diagnostic> {
+        let name_tok = self.advance();
+        let name = match &name_tok.kind {
+            TokenKind::Ident(n) => n.clone(),
+            _ => unreachable!("parse_ui_component called on a non-identifier"),
+        };
+        let start_span = name_tok.span;
+        match name.as_str() {
+            "Column" | "Row" | "Container" => {
+                let kind = match name.as_str() {
+                    "Column" => LayoutKind::Column,
+                    "Row" => LayoutKind::Row,
+                    _ => LayoutKind::Container,
+                };
+                self.skip_newlines();
+                self.expect(&TokenKind::LBrace, "Expected '{' after layout name.")?;
+                let items = self.parse_ui_items()?;
+                let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' to end layout.")?;
+                Ok(UiComponent::Layout {
+                    kind,
+                    items,
+                    span: start_span.to(rbrace.span),
+                })
+            }
+            "Text" => {
+                self.expect(&TokenKind::LParen, "Expected '(' after 'Text'.")?;
+                let value = self.parse_expression(0)?;
+                let rparen =
+                    self.expect(&TokenKind::RParen, "Expected ')' after Text argument.")?;
+                Ok(UiComponent::Text {
+                    value,
+                    span: start_span.to(rparen.span),
+                })
+            }
+            "Button" => {
+                self.expect(&TokenKind::LParen, "Expected '(' after 'Button'.")?;
+                let label = self.parse_expression(0)?;
+                self.expect(&TokenKind::RParen, "Expected ')' after Button label.")?;
+                self.skip_newlines();
+                self.expect(&TokenKind::LBrace, "Expected '{' after Button(...).")?;
+                let handler = self.parse_ui_event_handler()?;
+                let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' to end Button.")?;
+                Ok(UiComponent::Button {
+                    label,
+                    handler,
+                    span: start_span.to(rbrace.span),
+                })
+            }
+            "TextField" | "Checkbox" => {
+                let is_text_field = name == "TextField";
+                self.expect(&TokenKind::LParen, "Expected '(' after component name.")?;
+                let bound = self.parse_expression(0)?;
+                self.expect(&TokenKind::RParen, "Expected ')' after component argument.")?;
+                self.skip_newlines();
+                self.expect(&TokenKind::LBrace, "Expected '{' after component(...).")?;
+                let handler = self.parse_ui_change_handler()?;
+                let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' to end component.")?;
+                let span = start_span.to(rbrace.span);
+                if is_text_field {
+                    Ok(UiComponent::TextField {
+                        bound,
+                        handler,
+                        span,
+                    })
+                } else {
+                    Ok(UiComponent::Checkbox {
+                        bound,
+                        handler,
+                        span,
+                    })
+                }
+            }
+            "Spacer" | "Divider" => {
+                // Bare `Spacer` / `Divider`, or an empty `Spacer {}` block.
+                self.skip_newlines();
+                let mut end_span = start_span;
+                if self.check(&TokenKind::LBrace) {
+                    self.advance();
+                    self.skip_newlines();
+                    let rbrace = self.expect(&TokenKind::RBrace, "Expected '}' after Spacer/Divider '{'.")?;
+                    end_span = rbrace.span;
+                }
+                let span = start_span.to(end_span);
+                if name == "Spacer" {
+                    Ok(UiComponent::Spacer { span })
+                } else {
+                    Ok(UiComponent::Divider { span })
+                }
+            }
+            "Image" => {
+                self.expect(&TokenKind::LParen, "Expected '(' after 'Image'.")?;
+                let source = self.parse_expression(0)?;
+                let rparen =
+                    self.expect(&TokenKind::RParen, "Expected ')' after Image argument.")?;
+                Ok(UiComponent::Image {
+                    source,
+                    span: start_span.to(rparen.span),
+                })
+            }
+            _ => Err(Diagnostic::error(
+                "Syntax Error",
+                self.file_name,
+                start_span,
+                format!("Unknown component '{}'.", name),
+                None,
+            )),
+        }
+    }
+
+    /// Inside a Button block: at most one `on_click { ... }`.
+    fn parse_ui_event_handler(&mut self) -> Result<Option<UiEventHandler>, Diagnostic> {
+        self.skip_newlines();
+        if self.check(&TokenKind::RBrace) {
+            return Ok(None);
+        }
+        match self.peek_kind() {
+            TokenKind::Ident(name) if name == "on_click" => {
+                self.advance();
+                let body = self.parse_block()?;
+                let span = body.span;
+                self.skip_newlines();
+                if !self.check(&TokenKind::RBrace) {
+                    return Err(Diagnostic::error(
+                        "Syntax Error",
+                        self.file_name,
+                        self.current_span(),
+                        "A Button block may only contain one on_click handler.",
+                        None,
+                    ));
+                }
+                Ok(Some(UiEventHandler { body, span }))
+            }
+            _ => Err(Diagnostic::error(
+                "Syntax Error",
+                self.file_name,
+                self.current_span(),
+                "Expected 'on_click' or '}' inside Button.",
+                Some("A Button block may only contain an on_click handler.".into()),
+            )),
+        }
+    }
+
+    /// Inside a TextField/Checkbox block: at most one `on_change(v) { ... }`.
+    fn parse_ui_change_handler(&mut self) -> Result<Option<UiChangeHandler>, Diagnostic> {
+        self.skip_newlines();
+        if self.check(&TokenKind::RBrace) {
+            return Ok(None);
+        }
+        match self.peek_kind() {
+            TokenKind::Ident(name) if name == "on_change" => {
+                self.advance();
+                self.expect(&TokenKind::LParen, "Expected '(' after 'on_change'.")?;
+                let param = self.expect_identifier("event parameter name")?;
+                self.expect(&TokenKind::RParen, "Expected ')' after on_change parameter.")?;
+                let body = self.parse_block()?;
+                let span = param.span.to(body.span);
+                self.skip_newlines();
+                if !self.check(&TokenKind::RBrace) {
+                    return Err(Diagnostic::error(
+                        "Syntax Error",
+                        self.file_name,
+                        self.current_span(),
+                        "A TextField/Checkbox block may only contain one on_change handler.",
+                        None,
+                    ));
+                }
+                Ok(Some(UiChangeHandler { param, body, span }))
+            }
+            _ => Err(Diagnostic::error(
+                "Syntax Error",
+                self.file_name,
+                self.current_span(),
+                "Expected 'on_change' or '}' inside TextField/Checkbox.",
+                Some("A TextField/Checkbox block may only contain an on_change handler.".into()),
+            )),
+        }
+    }
+
+    fn expect_string(&mut self, context: &str) -> Result<(String, Span), Diagnostic> {
+        let tok = self.advance();
+        if let TokenKind::Str(value) = tok.kind {
+            Ok((value, tok.span))
+        } else {
+            Err(Diagnostic::error(
+                "Syntax Error",
+                self.file_name,
+                tok.span,
+                format!("Expected {}, found '{:?}'.", context, tok.kind),
+                None,
+            ))
+        }
     }
 
     fn parse_expression(&mut self, min_precedence: u8) -> Result<Expr, Diagnostic> {
@@ -461,4 +830,37 @@ enum DeclKind {
     Let,
     Var,
     Const,
+}
+
+/// Property names from spec section 4 (common + Window-only).
+fn is_ui_property_name(name: &str) -> bool {
+    matches!(
+        name,
+        "width"
+            | "height"
+            | "padding"
+            | "margin"
+            | "spacing"
+            | "background"
+            | "align"
+            | "visible"
+            | "title"
+            | "size"
+    )
+}
+
+fn is_ui_component_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Column"
+            | "Row"
+            | "Container"
+            | "Text"
+            | "Button"
+            | "TextField"
+            | "Checkbox"
+            | "Spacer"
+            | "Divider"
+            | "Image"
+    )
 }

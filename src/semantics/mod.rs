@@ -2,7 +2,7 @@ use crate::diagnostics::Diagnostic;
 use crate::span::Span;
 use crate::syntax::ast::*;
 use crate::types::Type;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Type information produced by semantic analysis and consumed by the native
 /// backend. Spans identify AST nodes; binding ids are stable across scopes.
@@ -14,6 +14,10 @@ pub struct AnalyzedProgram {
     pub slot_types: Vec<Type>,
     pub repeat_counters: HashMap<Span, usize>,
     pub actions: HashMap<String, ActionSignature>,
+    /// Slots of `state` variables declared inside an `app` block. The
+    /// native backend stores these in a global state array instead of the
+    /// stack frame, so handlers and the render function can share them.
+    pub state_slots: HashSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +38,7 @@ pub struct SemanticAnalyzer {
     scopes: Vec<HashMap<String, Variable>>,
     actions: HashMap<String, ActionSignature>,
     analyzed: Option<AnalyzedProgram>,
+    state_slots: HashSet<usize>,
 }
 
 impl SemanticAnalyzer {
@@ -43,6 +48,7 @@ impl SemanticAnalyzer {
             scopes: vec![HashMap::new()],
             actions: HashMap::new(),
             analyzed: None,
+            state_slots: HashSet::new(),
         }
     }
 
@@ -55,14 +61,33 @@ impl SemanticAnalyzer {
         self.scopes.clear();
         self.scopes.push(HashMap::new());
         self.actions.clear();
+        self.state_slots.clear();
+
+        // A UI application is the whole program (spec section 7): it cannot
+        // be mixed with ordinary top-level statements or actions.
+        if program.statements.iter().any(|s| matches!(s, Stmt::UiApp { .. }))
+            && program.statements.len() != 1
+        {
+            let span = program
+                .statements
+                .iter()
+                .find(|s| matches!(s, Stmt::UiApp { .. }))
+                .map(|s| s.span())
+                .unwrap_or(program.span);
+            return Err(self.error(
+                span,
+                "app(...) must be the only top-level item of a UI program.",
+                Some("Move ordinary statements inside an event handler, or write a separate non-UI program.".into()),
+            ));
+        }
 
         let mut declarations = Vec::new();
         for stmt in &program.statements {
             if let Stmt::Action { name, params, .. } = stmt {
-                if name.name == "print" {
+                if name.name == "print" || name.name == "assert" {
                     return Err(self.error(
                         name.span,
-                        "The name 'print' is reserved.",
+                        format!("The name '{}' is reserved.", name.name),
                         Some("Choose another action name.".into()),
                     ));
                 }
@@ -105,6 +130,7 @@ impl SemanticAnalyzer {
             slot_types: Vec::new(),
             repeat_counters: HashMap::new(),
             actions: self.actions.clone(),
+            state_slots: HashSet::new(),
         };
         self.analyzed = Some(analyzed);
 
@@ -112,7 +138,9 @@ impl SemanticAnalyzer {
             self.analyze_stmt(stmt)?;
         }
 
-        Ok(self.analyzed.take().unwrap())
+        let mut analyzed = self.analyzed.take().unwrap();
+        analyzed.state_slots = self.state_slots.clone();
+        Ok(analyzed)
     }
 
     fn infer_actions(
@@ -257,6 +285,9 @@ impl SemanticAnalyzer {
                     .insert(*span, slot);
                 self.analyze_block(body)?;
             }
+            Stmt::UiApp { app, .. } => {
+                self.analyze_ui_app(app)?;
+            }
             Stmt::Expr(expr) => {
                 self.analyze_expr(expr)?;
             }
@@ -267,6 +298,303 @@ impl SemanticAnalyzer {
     fn analyze_block(&mut self, block: &Block) -> Result<(), Diagnostic> {
         self.push_scope();
         for stmt in &block.statements {
+            self.analyze_stmt(stmt)?;
+        }
+        self.pop_scope();
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // NEXA UI 1.0 semantic analysis (spec sections 3-7).
+    // ------------------------------------------------------------------
+
+    fn analyze_ui_app(&mut self, app: &UiApp) -> Result<(), Diagnostic> {
+        if self.scopes.len() != 1 {
+            return Err(self.error(
+                app.span,
+                "Nested app(...) blocks are not supported.",
+                None,
+            ));
+        }
+        // State declarations are registered before the Window so that
+        // every component and handler can refer to them.
+        for state in &app.states {
+            let ty = self.analyze_expr(&state.value)?;
+            match ty {
+                Type::Int | Type::Float | Type::String | Type::Bool => {}
+                _ => {
+                    return Err(self.error(
+                        state.value.span(),
+                        format!(
+                            "state '{}' must start as Int, Float, String or Bool, found {:?}.",
+                            state.name.name, ty
+                        ),
+                        None,
+                    ));
+                }
+            }
+            self.declare(&state.name, ty, true, state.name.span)?;
+            let slot = self
+                .analyzed
+                .as_ref()
+                .unwrap()
+                .bindings
+                .get(&state.name.span)
+                .copied()
+                .expect("state binding");
+            self.state_slots.insert(slot);
+        }
+        let window = app.window.as_ref().ok_or_else(|| {
+            self.error(
+                app.span,
+                "A UI application requires exactly one Window.",
+                Some("Add a Window { ... } block inside app(...).".into()),
+            )
+        })?;
+        self.analyze_ui_items(&window.items, true)
+    }
+
+    fn analyze_ui_items(&mut self, items: &[UiItem], is_window: bool) -> Result<(), Diagnostic> {
+        let mut seen: HashSet<String> = HashSet::new();
+        for item in items {
+            match item {
+                UiItem::Property(prop) => {
+                    self.analyze_ui_property(prop, is_window, &mut seen)?;
+                }
+                UiItem::Component(comp) => {
+                    self.analyze_ui_component(comp)?;
+                }
+                UiItem::EventHandler(handler) => {
+                    return Err(self.error(
+                        handler.span,
+                        "on_click is only allowed directly on a Button.",
+                        Some("Move the handler inside Button(...) { on_click { ... } }.".into()),
+                    ));
+                }
+                UiItem::ChangeHandler(handler) => {
+                    return Err(self.error(
+                        handler.span,
+                        "on_change is only allowed directly on a TextField or Checkbox.",
+                        None,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn analyze_ui_property(
+        &mut self,
+        prop: &UiProperty,
+        is_window: bool,
+        seen: &mut HashSet<String>,
+    ) -> Result<(), Diagnostic> {
+        if !seen.insert(prop.name.name.clone()) {
+            return Err(self.error(
+                prop.name.span,
+                format!("Duplicate property '{}'.", prop.name.name),
+                None,
+            ));
+        }
+        let expect_args = |n: usize, prop: &UiProperty, this: &Self| -> Result<(), Diagnostic> {
+            if prop.args.len() != n {
+                return Err(this.error(
+                    prop.span,
+                    format!(
+                        "Property '{}' expects {} argument(s), but received {}.",
+                        prop.name.name,
+                        n,
+                        prop.args.len()
+                    ),
+                    None,
+                ));
+            }
+            Ok(())
+        };
+        match prop.name.name.as_str() {
+            "title" => {
+                if !is_window {
+                    return Err(self.error(
+                        prop.name.span,
+                        "Property 'title' is only allowed on Window.",
+                        None,
+                    ));
+                }
+                expect_args(1, prop, self)?;
+                let ty = self.analyze_expr(&prop.args[0])?;
+                self.require_type(&ty, &Type::String, prop.args[0].span())?;
+            }
+            "size" => {
+                if !is_window {
+                    return Err(self.error(
+                        prop.name.span,
+                        "Property 'size' is only allowed on Window.",
+                        None,
+                    ));
+                }
+                expect_args(2, prop, self)?;
+                for arg in &prop.args {
+                    let ty = self.analyze_expr(arg)?;
+                    self.require_type(&ty, &Type::Int, arg.span())?;
+                }
+            }
+            "width" | "height" | "padding" | "margin" | "spacing" => {
+                expect_args(1, prop, self)?;
+                let ty = self.analyze_expr(&prop.args[0])?;
+                if ty != Type::Int && ty != Type::Float {
+                    return Err(self.error(
+                        prop.args[0].span(),
+                        format!(
+                            "Property '{}' expects a numeric value, found {:?}.",
+                            prop.name.name, ty
+                        ),
+                        None,
+                    ));
+                }
+            }
+            "background" => {
+                expect_args(1, prop, self)?;
+                let ty = self.analyze_expr(&prop.args[0])?;
+                self.require_type(&ty, &Type::String, prop.args[0].span())?;
+                if let Expr::Literal {
+                    lit: Literal::Str(value),
+                    ..
+                } = &prop.args[0]
+                {
+                    if !is_rrggbb(value) {
+                        return Err(self.error(
+                            prop.args[0].span(),
+                            format!(
+                                "Background color '{}' is not a valid #RRGGBB color.",
+                                value
+                            ),
+                            Some("Use the form \"#RRGGBB\", for example \"#1E90FF\".".into()),
+                        ));
+                    }
+                }
+            }
+            "align" => {
+                expect_args(1, prop, self)?;
+                let ty = self.analyze_expr(&prop.args[0])?;
+                self.require_type(&ty, &Type::String, prop.args[0].span())?;
+            }
+            "visible" => {
+                expect_args(1, prop, self)?;
+                let ty = self.analyze_expr(&prop.args[0])?;
+                self.require_type(&ty, &Type::Bool, prop.args[0].span())?;
+            }
+            other => {
+                return Err(self.error(
+                    prop.name.span,
+                    format!("Unknown property '{}'.", other),
+                    Some(
+                        "Valid properties: width, height, padding, margin, spacing, background, align, visible, title (Window only), size (Window only)."
+                            .into(),
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn analyze_ui_component(&mut self, comp: &UiComponent) -> Result<(), Diagnostic> {
+        match comp {
+            UiComponent::Layout { items, .. } => self.analyze_ui_items(items, false),
+            UiComponent::Text { value, .. } => {
+                let ty = self.analyze_expr(value)?;
+                match ty {
+                    Type::Int | Type::Float | Type::String | Type::Bool => Ok(()),
+                    _ => Err(self.error(
+                        value.span(),
+                        format!("Text() expects Int, Float, String or Bool, found {:?}.", ty),
+                        None,
+                    )),
+                }
+            }
+            UiComponent::Button { label, handler, .. } => {
+                let ty = self.analyze_expr(label)?;
+                self.require_type(&ty, &Type::String, label.span())?;
+                if let Some(h) = handler {
+                    self.analyze_ui_handler_body(&h.body, None)?;
+                }
+                Ok(())
+            }
+            UiComponent::TextField { bound, handler, .. } => {
+                self.check_ui_bound(bound, &Type::String, "TextField")?;
+                if let Some(h) = handler {
+                    self.analyze_ui_handler_body(&h.body, Some((&h.param, Type::String)))?;
+                }
+                Ok(())
+            }
+            UiComponent::Checkbox { bound, handler, .. } => {
+                self.check_ui_bound(bound, &Type::Bool, "Checkbox")?;
+                if let Some(h) = handler {
+                    self.analyze_ui_handler_body(&h.body, Some((&h.param, Type::Bool)))?;
+                }
+                Ok(())
+            }
+            UiComponent::Spacer { .. } | UiComponent::Divider { .. } => Ok(()),
+            UiComponent::Image { source, .. } => {
+                let ty = self.analyze_expr(source)?;
+                self.require_type(&ty, &Type::String, source.span())?;
+                Ok(())
+            }
+        }
+    }
+
+    /// TextField/Checkbox must be bound to a `state` variable of the right
+    /// type, e.g. `TextField(name)` / `Checkbox(checked)`.
+    fn check_ui_bound(&mut self, bound: &Expr, expected: &Type, comp_name: &str) -> Result<(), Diagnostic> {
+        let name = match bound {
+            Expr::Variable { name } => name,
+            _ => {
+                return Err(self.error(
+                    bound.span(),
+                    format!(
+                        "{} expects a state variable, for example {}(name).",
+                        comp_name, comp_name
+                    ),
+                    Some("Declare the value with 'state' inside app(...).".into()),
+                ));
+            }
+        };
+        // Analyze the bound expression so the backend has its type and
+        // binding recorded, like every other expression.
+        let ty = self.analyze_expr(bound)?;
+        let variable = self.lookup_variable(&name.name).ok_or_else(|| {
+            self.error(
+                name.span,
+                format!("Undefined variable '{}'.", name.name),
+                Some("Declare it with 'state' inside app(...).".into()),
+            )
+        })?;
+        if !self.state_slots.contains(&variable.slot) {
+            return Err(self.error(
+                name.span,
+                format!(
+                    "{} must be bound to a 'state' variable, but '{}' is not state.",
+                    comp_name, name.name
+                ),
+                None,
+            ));
+        }
+        if &ty != expected {
+            return Err(self.type_error(name.span, expected, &ty));
+        }
+        self.record_binding(name.span, variable.slot);
+        Ok(())
+    }
+
+    fn analyze_ui_handler_body(
+        &mut self,
+        body: &Block,
+        param: Option<(&Ident, Type)>,
+    ) -> Result<(), Diagnostic> {
+        self.push_scope();
+        if let Some((name, ty)) = param {
+            self.declare(name, ty, true, name.span)?;
+        }
+        for stmt in &body.statements {
             self.analyze_stmt(stmt)?;
         }
         self.pop_scope();
@@ -380,7 +708,18 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::Call { callee, args, span } => {
-                if callee.name == "print" {
+                if callee.name == "assert" {
+                    if args.len() != 1 {
+                        return Err(self.error(
+                            *span,
+                            "assert() requires exactly one argument.",
+                            Some("Example: assert(x > 0)".into()),
+                        ));
+                    }
+                    let argument_type = self.analyze_expr(&args[0])?;
+                    self.require_type(&argument_type, &Type::Bool, args[0].span())?;
+                    Type::Void
+                } else if callee.name == "print" {
                     if args.len() != 1 {
                         return Err(self.error(
                             *span,
@@ -719,6 +1058,68 @@ impl<'a> InferCtx<'a> {
                 }
             }
             Stmt::Action { .. } => {}
+            Stmt::UiApp { app, .. } => {
+                for state in &app.states {
+                    self.walk_expr(&state.value);
+                }
+                if let Some(window) = &app.window {
+                    for item in &window.items {
+                        self.walk_ui_item(item);
+                    }
+                }
+            }
+        }
+    }
+
+    fn walk_ui_item(&mut self, item: &UiItem) {
+        match item {
+            UiItem::Property(prop) => {
+                for arg in &prop.args {
+                    self.walk_expr(arg);
+                }
+            }
+            UiItem::Component(comp) => self.walk_ui_component(comp),
+            UiItem::EventHandler(handler) => {
+                for s in &handler.body.statements {
+                    self.walk_stmt(s);
+                }
+            }
+            UiItem::ChangeHandler(handler) => {
+                for s in &handler.body.statements {
+                    self.walk_stmt(s);
+                }
+            }
+        }
+    }
+
+    fn walk_ui_component(&mut self, comp: &UiComponent) {
+        match comp {
+            UiComponent::Layout { items, .. } => {
+                for item in items {
+                    self.walk_ui_item(item);
+                }
+            }
+            UiComponent::Text { value, .. } | UiComponent::Image { source: value, .. } => {
+                self.walk_expr(value);
+            }
+            UiComponent::Button { label, handler, .. } => {
+                self.walk_expr(label);
+                if let Some(h) = handler {
+                    for s in &h.body.statements {
+                        self.walk_stmt(s);
+                    }
+                }
+            }
+            UiComponent::TextField { bound, handler, .. }
+            | UiComponent::Checkbox { bound, handler, .. } => {
+                self.walk_expr(bound);
+                if let Some(h) = handler {
+                    for s in &h.body.statements {
+                        self.walk_stmt(s);
+                    }
+                }
+            }
+            UiComponent::Spacer { .. } | UiComponent::Divider { .. } => {}
         }
     }
 
@@ -824,7 +1225,7 @@ impl<'a> InferCtx<'a> {
                 for arg in args {
                     self.walk_expr(arg);
                 }
-                if callee.name == "print" {
+                if callee.name == "print" || callee.name == "assert" {
                     return;
                 }
                 for (index, arg) in args.iter().enumerate() {
@@ -903,4 +1304,10 @@ fn variable_param(expr: &Expr) -> Option<&str> {
     } else {
         None
     }
+}
+
+fn is_rrggbb(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].chars().all(|c| c.is_ascii_hexdigit())
 }

@@ -402,6 +402,8 @@ impl<'a> Lexer<'a> {
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
             "repeat" => TokenKind::Repeat,
+            "app" => TokenKind::App,
+            "state" => TokenKind::State,
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "not" => TokenKind::Not,

@@ -1,0 +1,28 @@
+app("Counter") {
+    state count = 0
+
+    Window {
+        title("Counter")
+        size(480, 320)
+
+        Column {
+            spacing(12)
+            padding(16)
+
+            Text("Hello, NEXA!")
+            Text(count)
+
+            Button("Increment") {
+                on_click {
+                    count = count + 1
+                }
+            }
+
+            Button("Reset") {
+                on_click {
+                    count = 0
+                }
+            }
+        }
+    }
+}

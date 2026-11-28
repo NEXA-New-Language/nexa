@@ -18,6 +18,10 @@ pub enum TokenKind {
     While,
     Repeat,
 
+    // NEXA UI 1.0 (see NEXA UI Language Specification 1.0, section 7).
+    App,
+    State,
+
     And,
     Or,
     Not,
