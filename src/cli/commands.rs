@@ -1,4 +1,5 @@
 use crate::analyze_source;
+use crate::lint_source;
 use crate::project::builder::{BuildMode, NativeBuilder};
 use crate::project::dependency::DependencyManager;
 use crate::project::lockfile::Lockfile;
@@ -121,6 +122,37 @@ impl CliHandler {
         match analyze_source(entry_path.to_str().unwrap(), &source) {
             Ok(_) => {
                 println!("    Finished check: no syntax or semantic errors found.");
+                Ok(())
+            }
+            Err(diag) => Err(diag.render(&source)),
+        }
+    }
+
+    pub fn handle_lint() -> Result<(), String> {
+        let project_dir = Self::find_project_root()?;
+        let (manifest, _) = Manifest::load_from_dir(&project_dir)?;
+        let entry_path = project_dir.join(&manifest.build.entry);
+
+        if !entry_path.exists() {
+            return Err(format!("Entry point '{}' not found.", entry_path.display()));
+        }
+
+        let source = fs::read_to_string(&entry_path).map_err(|e| e.to_string())?;
+
+        println!(
+            "    Linting `{}` v{}",
+            manifest.project.name, manifest.project.version
+        );
+        match lint_source(entry_path.to_str().unwrap(), &source) {
+            Ok(warnings) => {
+                if warnings.is_empty() {
+                    println!("    Finished lint: no issues found.");
+                } else {
+                    for warning in &warnings {
+                        println!("{}", warning.render(&source));
+                    }
+                    println!("    Finished lint: {} warning(s).", warnings.len());
+                }
                 Ok(())
             }
             Err(diag) => Err(diag.render(&source)),

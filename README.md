@@ -215,6 +215,20 @@ Generated native binaries are hardened by default:
 `tests/security_test.rs` covers the overflow traps and verifies the
 binary is a PIE (`DYN`) with a `GNU_RELRO` segment.
 
+## Lint
+
+`nexa lint` reports advisory warnings without failing the build:
+
+- unused variables (`let` / `var` / `const`), action parameters, and
+  UI `state` that is never read (an assignment is a write, not a read);
+- unused actions that are never called;
+- shadowing: a declaration that hides a variable from an outer scope.
+
+Warnings render with the file, line, column, and source line, like
+errors, but are headed `Warning:` and never stop compilation.
+`tests/lint_test.rs` covers the rules, including a clean run over the
+UI counter example.
+
 ## Project system notes
 
 `nexa.toml` and `nexa.lock` are preserved. Local path dependencies are resolved

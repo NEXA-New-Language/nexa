@@ -1,8 +1,25 @@
 use crate::span::Span;
 use std::fmt;
 
+/// Whether a diagnostic stops compilation or is advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+}
+
+impl Severity {
+    fn label(self) -> &'static str {
+        match self {
+            Severity::Error => "Error",
+            Severity::Warning => "Warning",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
+    pub severity: Severity,
     pub kind: String,
     pub file_name: String,
     pub span: Span,
@@ -19,6 +36,25 @@ impl Diagnostic {
         hint: Option<String>,
     ) -> Self {
         Self {
+            severity: Severity::Error,
+            kind: kind.into(),
+            file_name: file_name.into(),
+            span,
+            message: message.into(),
+            hint,
+        }
+    }
+
+    /// An advisory diagnostic: it is reported but never fails a build.
+    pub fn warning(
+        kind: impl Into<String>,
+        file_name: impl Into<String>,
+        span: Span,
+        message: impl Into<String>,
+        hint: Option<String>,
+    ) -> Self {
+        Self {
+            severity: Severity::Warning,
             kind: kind.into(),
             file_name: file_name.into(),
             span,
@@ -50,7 +86,7 @@ impl Diagnostic {
         let carets = "^".repeat(width);
 
         let mut out = String::new();
-        out.push_str(&format!("Error: {}\n\n", self.kind));
+        out.push_str(&format!("{}: {}\n\n", self.severity.label(), self.kind));
         out.push_str(&format!(
             "{}:{}:{}\n\n",
             self.file_name, self.span.line, self.span.col
@@ -71,8 +107,13 @@ impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Error: {} ({}:{}:{}) - {}",
-            self.kind, self.file_name, self.span.line, self.span.col, self.message
+            "{}: {} ({}:{}:{}) - {}",
+            self.severity.label(),
+            self.kind,
+            self.file_name,
+            self.span.line,
+            self.span.col,
+            self.message
         )
     }
 }

@@ -4,6 +4,7 @@ pub mod cli;
 pub mod codegen;
 pub mod diagnostics;
 pub mod ir;
+pub mod lint;
 pub mod project;
 pub mod semantics;
 pub mod span;
@@ -34,6 +35,13 @@ pub fn analyze_source(file_name: &str, source: &str) -> Result<Program, Diagnost
     let mut analyzer = SemanticAnalyzer::new(file_name);
     analyzer.analyze(&program)?;
     Ok(program)
+}
+
+/// Run `nexa lint` over a source file: parse it and return the advisory
+/// warnings. A parse failure is returned as an error; warnings never fail.
+pub fn lint_source(file_name: &str, source: &str) -> Result<Vec<Diagnostic>, Diagnostic> {
+    let program = parse_source(file_name, source)?;
+    Ok(lint::lint_program(file_name, &program))
 }
 
 /// True when the source is a NEXA UI 1.0 application (`app("Name") { ... }`).

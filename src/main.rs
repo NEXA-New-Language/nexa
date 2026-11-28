@@ -14,6 +14,7 @@ fn print_usage() {
     println!("  run              Build and execute native binary");
     println!("  run --release    Build and execute release binary");
     println!("  check            Analyze syntax and semantics without building binary");
+    println!("  lint             Report advisory warnings (unused code, shadowing)");
     println!("  test             Execute all tests in tests/");
     println!("  add <package>    Add a dependency to nexa.toml");
     println!("  remove <package> Remove a dependency from nexa.toml");
@@ -85,6 +86,7 @@ fn main() {
             CliHandler::handle_run(release)
         }
         "check" => CliHandler::handle_check(),
+        "lint" => CliHandler::handle_lint(),
         "test" => CliHandler::handle_test(),
         "add" => {
             if args.len() < 3 {
