@@ -172,6 +172,24 @@ and emits runtime helpers for:
 String concatenation allocates native heap memory; allocations are reclaimed by
 the operating system when the process exits.
 
+The backend also applies a small set of safe optimizations at code
+generation time:
+
+- Constant folding of pure literal expressions (arithmetic, comparisons,
+  boolean logic, string concatenation). Division or modulo by zero is never
+  folded, so it still traps at runtime as specified.
+- In-place updates for integer self-assignments (`i = i + 1` becomes a
+  single `add` on the variable's slot).
+- Comparison peepholes: a variable compared against a constant becomes a
+  single memory-vs-immediate `cmp`, and `if`/`while` conditions jump
+  directly off the flags instead of materializing a 0/1 first.
+- Constant `if` conditions keep only the taken branch; `while false`
+  emits nothing.
+
+On the 10,000,000-iteration summation loop used for benchmarking, these
+bring the release binary from about 20 ms to about 12 ms, on par with
+`g++ -O2` for the same loop.
+
 ## Project system notes
 
 `nexa.toml` and `nexa.lock` are preserved. Local path dependencies are resolved

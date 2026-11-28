@@ -371,6 +371,227 @@ impl<'a> GenCtx<'a> {
         }
     }
 
+    /// Emit a compile-time constant value (used by constant folding).
+    fn emit_const(&mut self, value: &ConstVal, out: &mut String) {
+        match value {
+            ConstVal::Int(v) => out.push_str(&format!("    mov rax, {}\n", v)),
+            ConstVal::Bool(v) => {
+                out.push_str(&format!("    mov rax, {}\n", if *v { 1 } else { 0 }))
+            }
+            ConstVal::Float(v) => {
+                let label = self.label("float");
+                self.floats.push((label.clone(), v.to_bits()));
+                out.push_str(&format!("    movsd xmm0, [rip + {}]\n", label));
+            }
+            ConstVal::Str(v) => {
+                let label = self.label("str");
+                self.strings.push((label.clone(), v.clone()));
+                out.push_str(&format!("    lea rax, [rip + {}]\n", label));
+            }
+        }
+    }
+
+    /// Memory operand for a binding: a stack slot, or the global state
+    /// array for a `state` variable.
+    fn slot_location(&self, slot: usize) -> String {
+        if self.is_state_slot(slot) {
+            format!("[rip + __nexa_ui_state + {}]", slot * 8)
+        } else {
+            format!("[rbp - {}]", self.offset(slot))
+        }
+    }
+
+    /// Peephole: `x = x +/- <expr>` on an integer variable updates the
+    /// variable in place instead of loading, computing and storing it.
+    /// Returns true when the assignment was emitted (or is a no-op).
+    fn try_gen_self_assign(&mut self, slot: usize, value: &Expr, out: &mut String) -> bool {
+        if self.analyzed.slot_types.get(slot) != Some(&Type::Int) {
+            return false;
+        }
+        let Expr::Binary { left, op, right, .. } = value else {
+            return false;
+        };
+        if !matches!(op, BinaryOp::Add | BinaryOp::Sub) {
+            return false;
+        }
+        let is_add = *op == BinaryOp::Add;
+        let is_self = |e: &Expr, slot: usize, this: &GenCtx| -> bool {
+            matches!(e, Expr::Variable { name } if this.binding(name.span) == slot)
+        };
+        // `x = x +/- e` or (for Add) `x = e + x`.
+        let other = if is_self(left, slot, self) {
+            right
+        } else if is_add && is_self(right, slot, self) {
+            left
+        } else {
+            return false;
+        };
+        let loc = self.slot_location(slot);
+        match const_eval(other) {
+            Some(ConstVal::Int(c)) => {
+                // `x = x + 0` is a no-op; anything else is one instruction.
+                if c != 0 {
+                    let instr = if is_add { "add" } else { "sub" };
+                    out.push_str(&format!("    {} qword ptr {}, {}\n", instr, loc, c));
+                }
+                true
+            }
+            _ => {
+                self.gen_expr(other, 0, out);
+                let instr = if is_add { "add" } else { "sub" };
+                out.push_str(&format!("    {} qword ptr {}, rax\n", instr, loc));
+                true
+            }
+        }
+    }
+
+    /// Emit `cmp` for an integer/boolean comparison in its cheapest form
+    /// (memory vs. immediate when one side is a variable and the other a
+    /// constant) and return the effective operator after any operand flip.
+    fn gen_int_cmp(
+        &mut self,
+        left: &Expr,
+        op: BinaryOp,
+        right: &Expr,
+        depth: usize,
+        out: &mut String,
+    ) -> BinaryOp {
+        if let Expr::Variable { name } = left {
+            if let Some(ConstVal::Int(c)) = const_eval(right) {
+                let loc = self.slot_location(self.binding(name.span));
+                out.push_str(&format!("    cmp qword ptr {}, {}\n", loc, c));
+                return op;
+            }
+        }
+        if let Expr::Variable { name } = right {
+            if let Some(ConstVal::Int(c)) = const_eval(left) {
+                let loc = self.slot_location(self.binding(name.span));
+                out.push_str(&format!("    cmp qword ptr {}, {}\n", loc, c));
+                return flip_cmp_op(op);
+            }
+        }
+        if let Expr::Variable { name } = left {
+            let loc = self.slot_location(self.binding(name.span));
+            self.gen_expr(right, depth, out);
+            out.push_str("    mov rbx, rax\n");
+            out.push_str(&format!("    cmp qword ptr {}, rbx\n", loc));
+            return op;
+        }
+        if let Expr::Variable { name } = right {
+            let loc = self.slot_location(self.binding(name.span));
+            self.gen_expr(left, depth, out);
+            out.push_str(&format!("    cmp rax, qword ptr {}\n", loc));
+            return op;
+        }
+        let left_ty = self.gen_expr(left, depth, out);
+        let temp = self.temp_offset(depth);
+        store_temp(out, &left_ty, temp);
+        self.gen_expr(right, depth + 1, out);
+        out.push_str("    mov rbx, rax\n");
+        out.push_str(&format!("    mov rax, [rbp - {}]\n", temp));
+        out.push_str("    cmp rax, rbx\n");
+        op
+    }
+
+    /// Emit a conditional jump to `label` when `expr` evaluates to
+    /// `jump_when`. Integer comparisons jump directly off the flags
+    /// instead of materializing a 0/1 in rax first.
+    fn gen_branch(
+        &mut self,
+        expr: &Expr,
+        label: &str,
+        jump_when: bool,
+        depth: usize,
+        out: &mut String,
+    ) {
+        if let Some(ConstVal::Bool(b)) = const_eval(expr) {
+            if b == jump_when {
+                out.push_str(&format!("    jmp {}\n", label));
+            }
+            return;
+        }
+        match expr {
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+                ..
+            } => {
+                self.gen_branch(inner, label, !jump_when, depth, out);
+            }
+            Expr::Binary { left, op, right, .. }
+                if matches!(
+                    op,
+                    BinaryOp::Equal
+                        | BinaryOp::NotEqual
+                        | BinaryOp::Less
+                        | BinaryOp::LessEq
+                        | BinaryOp::Greater
+                        | BinaryOp::GreaterEq
+                ) && (self.expr_type(left) == Type::Int
+                    || self.expr_type(left) == Type::Bool) =>
+            {
+                let eff = self.gen_int_cmp(left, *op, right, depth, out);
+                let jmp = match (eff, jump_when) {
+                    (BinaryOp::Equal, true) => "je",
+                    (BinaryOp::Equal, false) => "jne",
+                    (BinaryOp::NotEqual, true) => "jne",
+                    (BinaryOp::NotEqual, false) => "je",
+                    (BinaryOp::Less, true) => "jl",
+                    (BinaryOp::Less, false) => "jge",
+                    (BinaryOp::LessEq, true) => "jle",
+                    (BinaryOp::LessEq, false) => "jg",
+                    (BinaryOp::Greater, true) => "jg",
+                    (BinaryOp::Greater, false) => "jle",
+                    (BinaryOp::GreaterEq, true) => "jge",
+                    (BinaryOp::GreaterEq, false) => "jl",
+                    _ => unreachable!(),
+                };
+                out.push_str(&format!("    {} {}\n", jmp, label));
+            }
+            Expr::Binary {
+                left,
+                op: BinaryOp::And,
+                right,
+                ..
+            } => {
+                if jump_when {
+                    let next = self.label("and_next");
+                    self.gen_branch(left, &next, false, depth, out);
+                    self.gen_branch(right, label, true, depth, out);
+                    out.push_str(&format!("{}:\n", next));
+                } else {
+                    self.gen_branch(left, label, false, depth, out);
+                    self.gen_branch(right, label, false, depth, out);
+                }
+            }
+            Expr::Binary {
+                left,
+                op: BinaryOp::Or,
+                right,
+                ..
+            } => {
+                if jump_when {
+                    self.gen_branch(left, label, true, depth, out);
+                    self.gen_branch(right, label, true, depth, out);
+                } else {
+                    let next = self.label("or_next");
+                    self.gen_branch(left, &next, true, depth, out);
+                    self.gen_branch(right, label, false, depth, out);
+                    out.push_str(&format!("{}:\n", next));
+                }
+            }
+            _ => {
+                self.gen_expr(expr, depth, out);
+                out.push_str("    test rax, rax\n");
+                out.push_str(&format!(
+                    "    {} {}\n",
+                    if jump_when { "jnz" } else { "jz" },
+                    label
+                ));
+            }
+        }
+    }
+
     fn intern_string(&mut self, value: &str) -> String {
         let label = self.label("str");
         self.strings.push((label.clone(), value.to_string()));
@@ -753,9 +974,11 @@ impl<'a> GenCtx<'a> {
                 self.store_slot(out, &ty, slot);
             }
             Stmt::Assign { target, value, .. } => {
-                let ty = self.gen_expr(value, depth, out);
                 let slot = self.binding(target.span);
-                self.store_slot(out, &ty, slot);
+                if !self.try_gen_self_assign(slot, value, out) {
+                    let ty = self.gen_expr(value, depth, out);
+                    self.store_slot(out, &ty, slot);
+                }
             }
             Stmt::UiApp { .. } => {
                 // A UI application is compiled by generate_ui_analyzed, not
@@ -767,18 +990,33 @@ impl<'a> GenCtx<'a> {
                 else_branch,
                 ..
             } => {
+                // A constant condition keeps only the taken branch.
+                if let Some(ConstVal::Bool(b)) = const_eval(condition) {
+                    let branch = if b {
+                        Some(then_branch)
+                    } else {
+                        else_branch.as_ref()
+                    };
+                    if let Some(block) = branch {
+                        for s in &block.statements {
+                            self.gen_stmt(s, depth, out);
+                        }
+                    }
+                    return;
+                }
                 let else_lbl = self.label("else");
                 let end_lbl = self.label("endif");
-                self.gen_expr(condition, depth, out);
-                out.push_str("    test rax, rax\n");
-                out.push_str(&format!(
-                    "    jz {}\n",
+                self.gen_branch(
+                    condition,
                     if else_branch.is_some() {
                         &else_lbl
                     } else {
                         &end_lbl
-                    }
-                ));
+                    },
+                    false,
+                    depth,
+                    out,
+                );
                 for s in &then_branch.statements {
                     self.gen_stmt(s, depth, out);
                 }
@@ -793,12 +1031,14 @@ impl<'a> GenCtx<'a> {
             Stmt::While {
                 condition, body, ..
             } => {
+                // `while false` never runs; anything else keeps looping.
+                if const_eval(condition) == Some(ConstVal::Bool(false)) {
+                    return;
+                }
                 let start = self.label("while_start");
                 let end = self.label("while_end");
                 out.push_str(&format!("{}:\n", start));
-                self.gen_expr(condition, depth, out);
-                out.push_str("    test rax, rax\n");
-                out.push_str(&format!("    jz {}\n", end));
+                self.gen_branch(condition, &end, false, depth, out);
                 for s in &body.statements {
                     self.gen_stmt(s, depth, out);
                 }
@@ -830,6 +1070,12 @@ impl<'a> GenCtx<'a> {
 
     fn gen_expr(&mut self, expr: &Expr, depth: usize, out: &mut String) -> Type {
         let result_ty = self.expr_type(expr);
+        // Constant folding: a wholly constant expression is evaluated at
+        // compile time, so no code is emitted for it at all.
+        if let Some(folded) = const_eval(expr) {
+            self.emit_const(&folded, out);
+            return result_ty;
+        }
         match expr {
             Expr::Literal { lit, .. } => match lit {
                 Literal::Int(v) => out.push_str(&format!("    mov rax, {}\n", v)),
@@ -904,6 +1150,34 @@ impl<'a> GenCtx<'a> {
                     return Type::Bool;
                 }
 
+                // Integer/boolean comparisons use the peephole path:
+                // no operand is materialized when a cheaper `cmp` exists.
+                let left_ty_static = self.expr_type(left);
+                if (left_ty_static == Type::Int || left_ty_static == Type::Bool)
+                    && matches!(
+                        op,
+                        BinaryOp::Equal
+                            | BinaryOp::NotEqual
+                            | BinaryOp::Less
+                            | BinaryOp::LessEq
+                            | BinaryOp::Greater
+                            | BinaryOp::GreaterEq
+                    )
+                {
+                    let eff = self.gen_int_cmp(left, *op, right, depth, out);
+                    let set = match eff {
+                        BinaryOp::Equal => "sete",
+                        BinaryOp::NotEqual => "setne",
+                        BinaryOp::Less => "setl",
+                        BinaryOp::LessEq => "setle",
+                        BinaryOp::Greater => "setg",
+                        BinaryOp::GreaterEq => "setge",
+                        _ => unreachable!(),
+                    };
+                    out.push_str(&format!("    {} al\n    movzx rax, al\n", set));
+                    return result_ty;
+                }
+
                 let left_ty = self.gen_expr(left, depth, out);
                 let temp = self.temp_offset(depth);
                 store_temp(out, &left_ty, temp);
@@ -976,19 +1250,7 @@ impl<'a> GenCtx<'a> {
                     BinaryOp::Mod => {
                         out.push_str("    mov rdi, rax\n    mov rsi, rbx\n    call __nexa_mod\n")
                     }
-                    _ => {
-                        out.push_str("    cmp rax, rbx\n");
-                        let set = match op {
-                            BinaryOp::Equal => "sete",
-                            BinaryOp::NotEqual => "setne",
-                            BinaryOp::Less => "setl",
-                            BinaryOp::LessEq => "setle",
-                            BinaryOp::Greater => "setg",
-                            BinaryOp::GreaterEq => "setge",
-                            _ => unreachable!(),
-                        };
-                        out.push_str(&format!("    {} al\n    movzx rax, al\n", set));
-                    }
+                    _ => unreachable!("integer comparisons use the peephole path"),
                 }
             }
             Expr::Call { callee, args, .. } => {
@@ -1602,4 +1864,107 @@ __nexa_print_bool:
 .Lerr_oom_len = . - .Lerr_oom
 .text
 "#
+}
+
+/// A compile-time constant value, for constant folding.
+#[derive(Debug, Clone, PartialEq)]
+enum ConstVal {
+    Int(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+}
+
+/// Evaluate a pure expression at compile time. Returns `None` for anything
+/// that is not a constant (variables, calls) or whose evaluation could trap
+/// (integer division/modulo by zero or overflow, which the runtime reports
+/// as an error and must keep trapping).
+fn const_eval(expr: &Expr) -> Option<ConstVal> {
+    match expr {
+        Expr::Literal { lit, .. } => Some(match lit {
+            Literal::Int(v) => ConstVal::Int(*v),
+            Literal::Float(v) => ConstVal::Float(*v),
+            Literal::Str(v) => ConstVal::Str(v.clone()),
+            Literal::Bool(v) => ConstVal::Bool(*v),
+        }),
+        Expr::Unary { op, expr, .. } => {
+            let v = const_eval(expr)?;
+            match (op, v) {
+                (UnaryOp::Negate, ConstVal::Int(v)) => Some(ConstVal::Int(v.wrapping_neg())),
+                (UnaryOp::Negate, ConstVal::Float(v)) => Some(ConstVal::Float(-v)),
+                (UnaryOp::Not, ConstVal::Bool(v)) => Some(ConstVal::Bool(!v)),
+                _ => None,
+            }
+        }
+        Expr::Binary { left, op, right, .. } => {
+            if *op == BinaryOp::And {
+                return match (const_eval(left)?, const_eval(right)?) {
+                    (ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(a && b)),
+                    _ => None,
+                };
+            }
+            if *op == BinaryOp::Or {
+                return match (const_eval(left)?, const_eval(right)?) {
+                    (ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(a || b)),
+                    _ => None,
+                };
+            }
+            let l = const_eval(left)?;
+            let r = const_eval(right)?;
+            match (l, r) {
+                (ConstVal::Int(a), ConstVal::Int(b)) => match op {
+                    BinaryOp::Add => Some(ConstVal::Int(a.wrapping_add(b))),
+                    BinaryOp::Sub => Some(ConstVal::Int(a.wrapping_sub(b))),
+                    BinaryOp::Mul => Some(ConstVal::Int(a.wrapping_mul(b))),
+                    BinaryOp::Div => Some(ConstVal::Int(a.checked_div(b)?)),
+                    BinaryOp::Mod => Some(ConstVal::Int(a.checked_rem(b)?)),
+                    BinaryOp::Equal => Some(ConstVal::Bool(a == b)),
+                    BinaryOp::NotEqual => Some(ConstVal::Bool(a != b)),
+                    BinaryOp::Less => Some(ConstVal::Bool(a < b)),
+                    BinaryOp::LessEq => Some(ConstVal::Bool(a <= b)),
+                    BinaryOp::Greater => Some(ConstVal::Bool(a > b)),
+                    BinaryOp::GreaterEq => Some(ConstVal::Bool(a >= b)),
+                    _ => None,
+                },
+                (ConstVal::Float(a), ConstVal::Float(b)) => match op {
+                    BinaryOp::Add => Some(ConstVal::Float(a + b)),
+                    BinaryOp::Sub => Some(ConstVal::Float(a - b)),
+                    BinaryOp::Mul => Some(ConstVal::Float(a * b)),
+                    BinaryOp::Div => Some(ConstVal::Float(a / b)),
+                    BinaryOp::Mod => Some(ConstVal::Float(a % b)),
+                    BinaryOp::Equal => Some(ConstVal::Bool(a == b)),
+                    BinaryOp::NotEqual => Some(ConstVal::Bool(a != b)),
+                    BinaryOp::Less => Some(ConstVal::Bool(a < b)),
+                    BinaryOp::LessEq => Some(ConstVal::Bool(a <= b)),
+                    BinaryOp::Greater => Some(ConstVal::Bool(a > b)),
+                    BinaryOp::GreaterEq => Some(ConstVal::Bool(a >= b)),
+                    _ => None,
+                },
+                (ConstVal::Bool(a), ConstVal::Bool(b)) => match op {
+                    BinaryOp::Equal => Some(ConstVal::Bool(a == b)),
+                    BinaryOp::NotEqual => Some(ConstVal::Bool(a != b)),
+                    _ => None,
+                },
+                (ConstVal::Str(a), ConstVal::Str(b)) => match op {
+                    BinaryOp::Add => Some(ConstVal::Str(format!("{}{}", a, b))),
+                    BinaryOp::Equal => Some(ConstVal::Bool(a == b)),
+                    BinaryOp::NotEqual => Some(ConstVal::Bool(a != b)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Swap a comparison's operands (used when the constant is on the left).
+fn flip_cmp_op(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Less => BinaryOp::Greater,
+        BinaryOp::LessEq => BinaryOp::GreaterEq,
+        BinaryOp::Greater => BinaryOp::Less,
+        BinaryOp::GreaterEq => BinaryOp::LessEq,
+        other => other,
+    }
 }
