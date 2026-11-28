@@ -84,10 +84,10 @@ impl SemanticAnalyzer {
         let mut declarations = Vec::new();
         for stmt in &program.statements {
             if let Stmt::Action { name, params, .. } = stmt {
-                if name.name == "print" {
+                if name.name == "print" || name.name == "assert" {
                     return Err(self.error(
                         name.span,
-                        "The name 'print' is reserved.",
+                        format!("The name '{}' is reserved.", name.name),
                         Some("Choose another action name.".into()),
                     ));
                 }
@@ -708,7 +708,18 @@ impl SemanticAnalyzer {
                 }
             }
             Expr::Call { callee, args, span } => {
-                if callee.name == "print" {
+                if callee.name == "assert" {
+                    if args.len() != 1 {
+                        return Err(self.error(
+                            *span,
+                            "assert() requires exactly one argument.",
+                            Some("Example: assert(x > 0)".into()),
+                        ));
+                    }
+                    let argument_type = self.analyze_expr(&args[0])?;
+                    self.require_type(&argument_type, &Type::Bool, args[0].span())?;
+                    Type::Void
+                } else if callee.name == "print" {
                     if args.len() != 1 {
                         return Err(self.error(
                             *span,
@@ -1214,7 +1225,7 @@ impl<'a> InferCtx<'a> {
                 for arg in args {
                     self.walk_expr(arg);
                 }
-                if callee.name == "print" {
+                if callee.name == "print" || callee.name == "assert" {
                     return;
                 }
                 for (index, arg) in args.iter().enumerate() {

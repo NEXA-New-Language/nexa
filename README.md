@@ -61,6 +61,9 @@ The native backend supports the existing NEXA grammar:
 - `repeat <integer-expression> { ... }` loops.
 - Top-level `action name(params) { ... }` declarations and calls.
 - Built-in `print(value)` for integers, floats, strings, and booleans.
+- Built-in `assert(condition)`; a failed assertion prints
+  `assertion failed` to stderr and exits with status 1. The argument
+  must be a `Bool`, and the name `assert` is reserved.
 - Line comments with `//`.
 - Newline-separated statements; semicolons are forbidden.
 

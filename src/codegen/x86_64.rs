@@ -1268,6 +1268,19 @@ impl<'a> GenCtx<'a> {
                 }
             }
             Expr::Call { callee, args, .. } => {
+                if callee.name == "assert" {
+                    let ok = self.label("assert_ok");
+                    self.gen_expr(&args[0], depth, out);
+                    out.push_str("    test rax, rax\n");
+                    out.push_str(&format!("    jnz {}\n", ok));
+                    out.push_str(
+                        "    sub rsp, 8\n    lea rdi, [rip + .Lerr_assert]\n    mov rsi, 17\n    call __nexa_runtime_error\n",
+                    );
+                    out.push_str(&format!("{}:\n", ok));
+                    out.push_str("    xor eax, eax\n");
+                    return Type::Void;
+                }
+
                 if callee.name == "print" {
                     let ty = self.gen_expr(&args[0], depth, out);
                     match ty {
@@ -1877,6 +1890,9 @@ __nexa_print_bool:
 .Lerr_div_overflow:
     .ascii "integer division overflow\n"
 .Lerr_div_overflow_len = . - .Lerr_div_overflow
+.Lerr_assert:
+    .ascii "assertion failed\n"
+.Lerr_assert_len = . - .Lerr_assert
 .Lerr_int_overflow:
     .ascii "integer overflow\n"
 .Lerr_int_overflow_len = . - .Lerr_int_overflow
