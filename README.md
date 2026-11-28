@@ -17,17 +17,15 @@ From a checkout, or straight from GitHub (requires cargo and `cc`):
 
 ```sh
 ./install.sh                        # from a NEXA source checkout
-cargo install --git https://github.com/NEXA-New-Language/nexa --branch feature/ui-1.0 --locked nexa
+cargo install --git https://github.com/NEXA-New-Language/nexa --locked nexa
 ```
 
 `install.sh` also accepts `--branch <name>` (or `NEXA_BRANCH=<name>`).
 It installs the `nexa` binary into `~/.cargo/bin`; add that to your
 `PATH` if it is not there already. Verify with `nexa --version`.
 
-> The UI 1.0 compiler, `assert`, and `nexa lint` currently live on the
-> `feature/ui-1.0` branch; install from that branch until they land on
-> `main`. The release profile (`opt-level = 3`, LTO, stripped) keeps
-> the installed compiler around 1.2 MB.
+The release profile (`opt-level = 3`, LTO, stripped) keeps the
+installed compiler around 1.2 MB.
 
 ## Build the compiler
 
